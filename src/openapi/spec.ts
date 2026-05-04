@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import { resolve } from 'node:path';
 import type { OpenAPIV3_1 } from 'openapi-types';
 
 /**
@@ -6,11 +8,23 @@ import type { OpenAPIV3_1 } from 'openapi-types';
  * This spec documents the current route surface for core and OpenClaw endpoints.
  * It provides a maintainable, realistic subset covering the documented API surface.
  */
+
+// Read version from package.json
+const PKG_VERSION = (() => {
+	const pkgPath = resolve(__dirname, '../../../package.json');
+	const raw = fs.readFileSync(pkgPath, 'utf8');
+	const pkg = JSON.parse(raw) as { version?: unknown };
+	if (typeof pkg.version !== 'string' || pkg.version.trim().length === 0) {
+		throw new Error('Unable to resolve server version from package.json');
+	}
+	return pkg.version;
+})();
+
 export const openapiSpec: OpenAPIV3_1.Document = {
 	openapi: '3.1.0',
 	info: {
 		title: 'Camofox Browser API',
-		version: '2.3.0',
+		version: PKG_VERSION,
 		description:
 			'Camofox is a fingerprint-resistant browser automation server powered by Camoufox. ' +
 			'It provides both a core REST API and OpenClaw-compatible endpoints for browser automation tasks.',
@@ -40,10 +54,28 @@ export const openapiSpec: OpenAPIV3_1.Document = {
 									type: 'object',
 									properties: {
 										ok: { type: 'boolean' },
-										enabled: { type: 'boolean' },
 										running: { type: 'boolean' },
-										engine: { type: 'string' },
+										engine: { type: 'string', example: 'camoufox' },
 										version: { type: 'string' },
+										browserConnected: { type: 'boolean' },
+										poolSize: { type: 'number' },
+										activeUserIds: { type: 'array', items: { type: 'string' } },
+										profileDirsTotal: { type: 'number' },
+									},
+									required: ['ok', 'running', 'engine', 'version', 'browserConnected', 'poolSize', 'activeUserIds', 'profileDirsTotal'],
+								},
+							},
+						},
+					},
+					'500': {
+						description: 'Server error',
+						content: {
+							'application/json': {
+								schema: {
+									type: 'object',
+									properties: {
+										ok: { type: 'boolean', enum: [false] },
+										error: { type: 'string' },
 									},
 								},
 							},
@@ -59,18 +91,25 @@ export const openapiSpec: OpenAPIV3_1.Document = {
 				tags: ['Core'],
 				responses: {
 					'200': {
-						description: 'List of presets',
+						description: 'Map of preset names to preset configurations',
 						content: {
 							'application/json': {
 								schema: {
 									type: 'object',
 									properties: {
-										ok: { type: 'boolean' },
 										presets: {
-											type: 'array',
-											items: { type: 'string' },
+											type: 'object',
+											additionalProperties: {
+												type: 'object',
+												properties: {
+													locale: { type: 'string' },
+													timezoneId: { type: 'string' },
+													geolocation: { $ref: '#/components/schemas/GeolocationConfig' },
+												},
+											},
 										},
 									},
+									required: ['presets'],
 								},
 							},
 						},
@@ -100,18 +139,35 @@ export const openapiSpec: OpenAPIV3_1.Document = {
 								schema: {
 									type: 'object',
 									properties: {
-										ok: { type: 'boolean' },
+										running: { type: 'boolean' },
 										tabs: {
 											type: 'array',
 											items: {
 												type: 'object',
 												properties: {
+													targetId: { type: 'string' },
 													tabId: { type: 'string' },
 													url: { type: 'string' },
 													title: { type: 'string' },
+													listItemId: { type: 'string' },
 												},
+												required: ['targetId', 'tabId', 'url', 'title', 'listItemId'],
 											},
 										},
+									},
+									required: ['running', 'tabs'],
+								},
+							},
+						},
+					},
+					'500': {
+						description: 'Server error',
+						content: {
+							'application/json': {
+								schema: {
+									type: 'object',
+									properties: {
+										error: { type: 'string' },
 									},
 								},
 							},
@@ -125,6 +181,7 @@ export const openapiSpec: OpenAPIV3_1.Document = {
 				summary: 'Navigate tab to URL',
 				description: 'Navigate the specified tab to a URL, macro, or search query',
 				tags: ['Core'],
+				security: [{ bearerAuth: [] }],
 				parameters: [
 					{
 						name: 'tabId',
@@ -157,6 +214,19 @@ export const openapiSpec: OpenAPIV3_1.Document = {
 							'application/json': {
 								schema: {
 									$ref: '#/components/schemas/NavigationResult',
+								},
+							},
+						},
+					},
+					'403': {
+						description: 'Forbidden - Invalid or missing API key',
+						content: {
+							'application/json': {
+								schema: {
+									type: 'object',
+									properties: {
+										error: { type: 'string', enum: ['Forbidden'] },
+									},
 								},
 							},
 						},
@@ -257,8 +327,9 @@ export const openapiSpec: OpenAPIV3_1.Document = {
 				summary: 'Open new tab (OpenClaw)',
 				description: 'Create a new browser tab with optional URL and configuration',
 				tags: ['OpenClaw'],
+				security: [{ bearerAuth: [] }],
 				requestBody: {
-					required: false,
+					required: true,
 					content: {
 						'application/json': {
 							schema: {
@@ -279,21 +350,78 @@ export const openapiSpec: OpenAPIV3_1.Document = {
 									},
 									geoMode: { type: 'string', enum: ['explicit-wins', 'proxy-locked'] },
 								},
+								required: ['url', 'userId'],
 							},
 						},
 					},
 				},
 				responses: {
 					'200': {
-						description: 'Tab created',
+						description: 'Tab created and navigated',
 						content: {
 							'application/json': {
 								schema: {
 									type: 'object',
 									properties: {
-										status: { type: 'string' },
+										ok: { type: 'boolean' },
 										targetId: { type: 'string' },
+										tabId: { type: 'string' },
 										url: { type: 'string' },
+										title: { type: 'string' },
+									},
+									required: ['ok', 'targetId', 'tabId', 'url', 'title'],
+								},
+							},
+						},
+					},
+					'400': {
+						description: 'Bad request - Missing required fields or invalid URL',
+						content: {
+							'application/json': {
+								schema: {
+									type: 'object',
+									properties: {
+										error: { type: 'string' },
+									},
+								},
+							},
+						},
+					},
+					'403': {
+						description: 'Forbidden - Invalid or missing API key',
+						content: {
+							'application/json': {
+								schema: {
+									type: 'object',
+									properties: {
+										error: { type: 'string', enum: ['Forbidden'] },
+									},
+								},
+							},
+						},
+					},
+					'409': {
+						description: 'Conflict - No canonical profile or session profile conflict',
+						content: {
+							'application/json': {
+								schema: {
+									type: 'object',
+									properties: {
+										error: { type: 'string' },
+										message: { type: 'string' },
+									},
+								},
+							},
+						},
+					},
+					'429': {
+						description: 'Too many tabs - Maximum tabs per session reached',
+						content: {
+							'application/json': {
+								schema: {
+									type: 'object',
+									properties: {
+										error: { type: 'string', enum: ['Maximum tabs per session reached'] },
 									},
 								},
 							},
@@ -307,6 +435,7 @@ export const openapiSpec: OpenAPIV3_1.Document = {
 				summary: 'Navigate (OpenClaw)',
 				description: 'Navigate to a URL, macro, or search query',
 				tags: ['OpenClaw'],
+				security: [{ bearerAuth: [] }],
 				requestBody: {
 					required: true,
 					content: {
@@ -331,6 +460,72 @@ export const openapiSpec: OpenAPIV3_1.Document = {
 							'application/json': {
 								schema: {
 									$ref: '#/components/schemas/NavigationResult',
+								},
+							},
+						},
+					},
+					'403': {
+						description: 'Forbidden - Invalid or missing API key',
+						content: {
+							'application/json': {
+								schema: {
+									type: 'object',
+									properties: {
+										error: { type: 'string', enum: ['Forbidden'] },
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		'/stop': {
+			post: {
+				summary: 'Stop server (OpenClaw)',
+				description: 'Stop the browser server and close all sessions',
+				tags: ['OpenClaw'],
+				security: [{ adminKey: [] }],
+				responses: {
+					'200': {
+						description: 'Server stopped successfully',
+						content: {
+							'application/json': {
+								schema: {
+									type: 'object',
+									properties: {
+										ok: { type: 'boolean' },
+										stopped: { type: 'boolean' },
+										profile: { type: 'string', example: 'camoufox' },
+									},
+									required: ['ok', 'stopped', 'profile'],
+								},
+							},
+						},
+					},
+					'403': {
+						description: 'Forbidden - Invalid or missing admin key',
+						content: {
+							'application/json': {
+								schema: {
+									type: 'object',
+									properties: {
+										error: { type: 'string', enum: ['Forbidden'] },
+									},
+								},
+							},
+						},
+					},
+					'500': {
+						description: 'Server error',
+						content: {
+							'application/json': {
+								schema: {
+									type: 'object',
+									properties: {
+										ok: { type: 'boolean', enum: [false] },
+										error: { type: 'string' },
+									},
 								},
 							},
 						},
@@ -390,6 +585,7 @@ export const openapiSpec: OpenAPIV3_1.Document = {
 				summary: 'Execute action (OpenClaw)',
 				description: 'Execute various browser actions like click, type, scroll, etc.',
 				tags: ['OpenClaw'],
+				security: [{ bearerAuth: [] }],
 				requestBody: {
 					required: true,
 					content: {
@@ -423,11 +619,37 @@ export const openapiSpec: OpenAPIV3_1.Document = {
 							},
 						},
 					},
+					'403': {
+						description: 'Forbidden - Invalid or missing API key',
+						content: {
+							'application/json': {
+								schema: {
+									type: 'object',
+									properties: {
+										error: { type: 'string', enum: ['Forbidden'] },
+									},
+								},
+							},
+						},
+					},
 				},
 			},
 		},
 	},
 	components: {
+		securitySchemes: {
+			bearerAuth: {
+				type: 'http',
+				scheme: 'bearer',
+				description: 'API key passed as Bearer token in Authorization header',
+			},
+			adminKey: {
+				type: 'apiKey',
+				in: 'header',
+				name: 'X-Admin-Key',
+				description: 'Admin key for privileged operations',
+			},
+		},
 		schemas: {
 			GeolocationConfig: {
 				type: 'object',

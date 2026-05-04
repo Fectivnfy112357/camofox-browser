@@ -1,5 +1,4 @@
 const { startServer, stopServer, getServerUrl } = require('../helpers/startServer');
-const { createClient } = require('../helpers/client');
 
 describe('OpenAPI/Docs Endpoints', () => {
   let serverUrl;
@@ -45,6 +44,123 @@ describe('OpenAPI/Docs Endpoints', () => {
       expect(spec.paths['/navigate']).toBeDefined();
       expect(spec.paths['/snapshot']).toBeDefined();
       expect(spec.paths['/act']).toBeDefined();
+      expect(spec.paths['/stop']).toBeDefined();
+    });
+    
+    test('spec includes security schemes', async () => {
+      const response = await fetch(`${serverUrl}/openapi.json`);
+      const spec = await response.json();
+      
+      // Verify security schemes are defined
+      expect(spec.components.securitySchemes).toBeDefined();
+      expect(spec.components.securitySchemes.bearerAuth).toBeDefined();
+      expect(spec.components.securitySchemes.bearerAuth.type).toBe('http');
+      expect(spec.components.securitySchemes.bearerAuth.scheme).toBe('bearer');
+      
+      expect(spec.components.securitySchemes.adminKey).toBeDefined();
+      expect(spec.components.securitySchemes.adminKey.type).toBe('apiKey');
+      expect(spec.components.securitySchemes.adminKey.in).toBe('header');
+      expect(spec.components.securitySchemes.adminKey.name).toBe('X-Admin-Key');
+    });
+    
+    test('protected routes have security requirements', async () => {
+      const response = await fetch(`${serverUrl}/openapi.json`);
+      const spec = await response.json();
+      
+      // Verify bearer auth is required for API-protected routes
+      expect(spec.paths['/tabs/{tabId}/navigate'].post.security).toEqual([{ bearerAuth: [] }]);
+      expect(spec.paths['/tabs/open'].post.security).toEqual([{ bearerAuth: [] }]);
+      expect(spec.paths['/navigate'].post.security).toEqual([{ bearerAuth: [] }]);
+      expect(spec.paths['/act'].post.security).toEqual([{ bearerAuth: [] }]);
+      
+      // Verify admin key is required for stop route
+      expect(spec.paths['/stop'].post.security).toEqual([{ adminKey: [] }]);
+    });
+    
+    test('response shapes match actual handlers for /health', async () => {
+      const response = await fetch(`${serverUrl}/openapi.json`);
+      const spec = await response.json();
+      
+      const healthResponse = spec.paths['/health'].get.responses['200'];
+      const schema = healthResponse.content['application/json'].schema;
+      
+      // Verify required fields match actual handler
+      expect(schema.required).toContain('ok');
+      expect(schema.required).toContain('running');
+      expect(schema.required).toContain('engine');
+      expect(schema.required).toContain('version');
+      expect(schema.required).toContain('browserConnected');
+      expect(schema.required).toContain('poolSize');
+      expect(schema.required).toContain('activeUserIds');
+      expect(schema.required).toContain('profileDirsTotal');
+      
+      // Verify properties match actual handler
+      expect(schema.properties.ok.type).toBe('boolean');
+      expect(schema.properties.running.type).toBe('boolean');
+      expect(schema.properties.engine.type).toBe('string');
+      expect(schema.properties.version.type).toBe('string');
+      expect(schema.properties.browserConnected.type).toBe('boolean');
+      expect(schema.properties.poolSize.type).toBe('number');
+      expect(schema.properties.activeUserIds.type).toBe('array');
+      expect(schema.properties.profileDirsTotal.type).toBe('number');
+    });
+    
+    test('response shapes match actual handlers for /presets', async () => {
+      const response = await fetch(`${serverUrl}/openapi.json`);
+      const spec = await response.json();
+      
+      const presetsResponse = spec.paths['/presets'].get.responses['200'];
+      const schema = presetsResponse.content['application/json'].schema;
+      
+      // Verify presets is required and is an object
+      expect(schema.required).toContain('presets');
+      expect(schema.properties.presets.type).toBe('object');
+      
+      // Verify preset structure includes locale, timezoneId, geolocation
+      const presetSchema = schema.properties.presets.additionalProperties;
+      expect(presetSchema.properties.locale).toBeDefined();
+      expect(presetSchema.properties.timezoneId).toBeDefined();
+      expect(presetSchema.properties.geolocation).toBeDefined();
+    });
+    
+    test('response shapes match actual handlers for /tabs', async () => {
+      const response = await fetch(`${serverUrl}/openapi.json`);
+      const spec = await response.json();
+      
+      const tabsResponse = spec.paths['/tabs'].get.responses['200'];
+      const schema = tabsResponse.content['application/json'].schema;
+      
+      // Verify required fields
+      expect(schema.required).toContain('running');
+      expect(schema.required).toContain('tabs');
+      
+      // Verify tab item structure matches actual handler
+      const tabItemSchema = schema.properties.tabs.items;
+      expect(tabItemSchema.required).toContain('targetId');
+      expect(tabItemSchema.required).toContain('tabId');
+      expect(tabItemSchema.required).toContain('url');
+      expect(tabItemSchema.required).toContain('title');
+      expect(tabItemSchema.required).toContain('listItemId');
+    });
+    
+    test('response shapes match actual handlers for /tabs/open', async () => {
+      const response = await fetch(`${serverUrl}/openapi.json`);
+      const spec = await response.json();
+      
+      const openResponse = spec.paths['/tabs/open'].post.responses['200'];
+      const schema = openResponse.content['application/json'].schema;
+      
+      // Verify required fields match actual handler
+      expect(schema.required).toContain('ok');
+      expect(schema.required).toContain('targetId');
+      expect(schema.required).toContain('tabId');
+      expect(schema.required).toContain('url');
+      expect(schema.required).toContain('title');
+      
+      // Verify request body requires url and userId
+      const requestSchema = spec.paths['/tabs/open'].post.requestBody.content['application/json'].schema;
+      expect(requestSchema.required).toContain('url');
+      expect(requestSchema.required).toContain('userId');
     });
     
     test('spec includes components and schemas', async () => {
