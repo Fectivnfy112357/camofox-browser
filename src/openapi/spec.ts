@@ -9,15 +9,29 @@ import type { OpenAPIV3_1 } from 'openapi-types';
  * It provides a maintainable, realistic subset covering the documented API surface.
  */
 
-// Read version from package.json
+// Read version from package.json, probing both src and dist paths
 const PKG_VERSION = (() => {
-	const pkgPath = resolve(__dirname, '../../../package.json');
-	const raw = fs.readFileSync(pkgPath, 'utf8');
-	const pkg = JSON.parse(raw) as { version?: unknown };
-	if (typeof pkg.version !== 'string' || pkg.version.trim().length === 0) {
-		throw new Error('Unable to resolve server version from package.json');
+	// Probe plausible paths for package.json (works from both src/openapi/spec.ts and dist/src/openapi/spec.js)
+	const possiblePaths = [
+		resolve(__dirname, '../../../package.json'),  // From dist/src/openapi/spec.js
+		resolve(__dirname, '../../package.json'),     // From src/openapi/spec.ts (via src root)
+	];
+	
+	for (const pkgPath of possiblePaths) {
+		try {
+			if (fs.existsSync(pkgPath)) {
+				const raw = fs.readFileSync(pkgPath, 'utf8');
+				const pkg = JSON.parse(raw) as { version?: unknown };
+				if (typeof pkg.version === 'string' && pkg.version.trim().length > 0) {
+					return pkg.version;
+				}
+			}
+		} catch {
+			// Try next path
+		}
 	}
-	return pkg.version;
+	
+	throw new Error('Unable to resolve server version from package.json');
 })();
 
 export const openapiSpec: OpenAPIV3_1.Document = {
@@ -213,7 +227,12 @@ export const openapiSpec: OpenAPIV3_1.Document = {
 						content: {
 							'application/json': {
 								schema: {
-									$ref: '#/components/schemas/NavigationResult',
+									type: 'object',
+									properties: {
+										ok: { type: 'boolean' },
+										url: { type: 'string' },
+									},
+									required: ['ok', 'url'],
 								},
 							},
 						},
@@ -459,7 +478,13 @@ export const openapiSpec: OpenAPIV3_1.Document = {
 						content: {
 							'application/json': {
 								schema: {
-									$ref: '#/components/schemas/NavigationResult',
+									type: 'object',
+									properties: {
+										ok: { type: 'boolean' },
+										targetId: { type: 'string' },
+										url: { type: 'string' },
+									},
+									required: ['ok', 'targetId', 'url'],
 								},
 							},
 						},
@@ -674,15 +699,6 @@ export const openapiSpec: OpenAPIV3_1.Document = {
 					url: { type: 'string' },
 					title: { type: 'string' },
 					toolCalls: { type: 'number' },
-				},
-			},
-			NavigationResult: {
-				type: 'object',
-				properties: {
-					ok: { type: 'boolean' },
-					url: { type: 'string' },
-					title: { type: 'string' },
-					status: { type: 'number' },
 				},
 			},
 		},

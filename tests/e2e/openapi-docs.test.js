@@ -163,6 +163,44 @@ describe('OpenAPI/Docs Endpoints', () => {
       expect(requestSchema.required).toContain('userId');
     });
     
+    test('response shapes match actual handlers for core /tabs/{tabId}/navigate', async () => {
+      const response = await fetch(`${serverUrl}/openapi.json`);
+      const spec = await response.json();
+      
+      const navigateResponse = spec.paths['/tabs/{tabId}/navigate'].post.responses['200'];
+      const schema = navigateResponse.content['application/json'].schema;
+      
+      // Core navigate returns only { ok, url } - no targetId, no title, no status
+      expect(schema.required).toEqual(['ok', 'url']);
+      expect(schema.properties.ok).toBeDefined();
+      expect(schema.properties.url).toBeDefined();
+      
+      // Verify no extra fields that handler doesn't return
+      expect(Object.keys(schema.properties)).toHaveLength(2);
+      expect(schema.properties.targetId).toBeUndefined();
+      expect(schema.properties.title).toBeUndefined();
+      expect(schema.properties.status).toBeUndefined();
+    });
+    
+    test('response shapes match actual handlers for OpenClaw /navigate', async () => {
+      const response = await fetch(`${serverUrl}/openapi.json`);
+      const spec = await response.json();
+      
+      const navigateResponse = spec.paths['/navigate'].post.responses['200'];
+      const schema = navigateResponse.content['application/json'].schema;
+      
+      // OpenClaw navigate returns { ok, targetId, url } - no title, no status
+      expect(schema.required).toEqual(['ok', 'targetId', 'url']);
+      expect(schema.properties.ok).toBeDefined();
+      expect(schema.properties.targetId).toBeDefined();
+      expect(schema.properties.url).toBeDefined();
+      
+      // Verify no extra fields that handler doesn't return
+      expect(Object.keys(schema.properties)).toHaveLength(3);
+      expect(schema.properties.title).toBeUndefined();
+      expect(schema.properties.status).toBeUndefined();
+    });
+    
     test('spec includes components and schemas', async () => {
       const response = await fetch(`${serverUrl}/openapi.json`);
       const spec = await response.json();
