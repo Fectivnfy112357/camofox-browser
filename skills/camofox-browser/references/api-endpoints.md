@@ -9,7 +9,7 @@ Related:
 - `./cli-commands.md`
 - `./openclaw-tools.md`
 
-Source of truth for development: `AGENTS.md`
+Source of truth for route behavior: the live handlers in `src/routes/core.ts` and `src/routes/openclaw.ts`
 
 ## OpenAPI Documentation
 

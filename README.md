@@ -469,7 +469,7 @@ Base URL: `http://localhost:9377`
 
 ### API Documentation
 
-The Camofox Browser API is fully documented using OpenAPI 3.1.0:
+The Camofox Browser API includes OpenAPI 3.1.0 docs for a representative subset of the shipped route surface:
 
 - **Interactive API Explorer**: [http://localhost:9377/api/docs](http://localhost:9377/api/docs) — Swagger UI with live request testing
 - **OpenAPI Specification**: [http://localhost:9377/openapi.json](http://localhost:9377/openapi.json) — Machine-readable OpenAPI 3.1.0 spec
