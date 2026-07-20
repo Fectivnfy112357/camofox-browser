@@ -374,3 +374,84 @@ describe('Cookie endpoint - without API key', () => {
     expect(data.count).toBe(1);
   });
 });
+
+describe('Cookie endpoint - GET /sessions/:userId/cookies', () => {
+  beforeAll(async () => {
+    await startServerWithApiKey(TEST_API_KEY);
+  }, 120000);
+
+  afterAll(async () => {
+    await stopServer();
+  }, 30000);
+
+  test('returns 403 without API key when CAMOFOX_API_KEY is set', async () => {
+    const res = await fetch(`${serverUrl}/sessions/user-without-auth/cookies`, { method: 'GET' });
+    expect(res.status).toBe(403);
+  });
+
+  test('returns 409 when no canonical profile exists', async () => {
+    const userId = `user-${crypto.randomUUID()}`;
+    const res = await fetch(`${serverUrl}/sessions/${encodeURIComponent(userId)}/cookies`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${TEST_API_KEY}` },
+    });
+    expect(res.status).toBe(409);
+    const data = await res.json();
+    expect(data.error).toBe('No canonical profile');
+  });
+
+  test('returns cookies that were just imported (round-trip via Playwright context)', async () => {
+    const userId = `user-${crypto.randomUUID()}`;
+    await establishCanonical(userId, { Authorization: `Bearer ${TEST_API_KEY}` });
+
+    const cookies = [
+      { name: 'session_id', value: 'abc123', domain: '.example.com', path: '/', httpOnly: true, secure: false },
+      { name: 'pref', value: 'light', domain: '.example.com', path: '/' },
+    ];
+    const importRes = await postCookies(userId, cookies, { Authorization: `Bearer ${TEST_API_KEY}` });
+    expect(importRes.status).toBe(200);
+
+    const getRes = await fetch(`${serverUrl}/sessions/${encodeURIComponent(userId)}/cookies`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${TEST_API_KEY}` },
+    });
+    expect(getRes.status).toBe(200);
+    const data = await getRes.json();
+    expect(data.ok).toBe(true);
+    expect(data.count).toBe(2);
+    expect(Array.isArray(data.cookies)).toBe(true);
+    const names = data.cookies.map((c) => c.name).sort();
+    expect(names).toEqual(['pref', 'session_id']);
+
+    const sessionId = data.cookies.find((c) => c.name === 'session_id');
+    expect(sessionId.value).toBe('abc123');
+    expect(sessionId.domain).toBe('.example.com');
+    expect(sessionId.httpOnly).toBe(true);
+  });
+
+  test('returns 400 when tabId query param is invalid', async () => {
+    const userId = `user-${crypto.randomUUID()}`;
+    await establishCanonical(userId, { Authorization: `Bearer ${TEST_API_KEY}` });
+
+    const res = await fetch(`${serverUrl}/sessions/${encodeURIComponent(userId)}/cookies?tabId=`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${TEST_API_KEY}` },
+    });
+    expect(res.status).toBe(400);
+    const data = await res.json();
+    expect(data.error).toContain('tabId');
+  });
+
+  test('returns 404 when tabId does not match an active tab', async () => {
+    const userId = `user-${crypto.randomUUID()}`;
+    await establishCanonical(userId, { Authorization: `Bearer ${TEST_API_KEY}` });
+
+    const res = await fetch(`${serverUrl}/sessions/${encodeURIComponent(userId)}/cookies?tabId=does-not-exist`, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${TEST_API_KEY}` },
+    });
+    expect(res.status).toBe(404);
+    const data = await res.json();
+    expect(data.error).toBe('Tab not found');
+  });
+});

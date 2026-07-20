@@ -254,7 +254,89 @@ router.post(
 	},
 );
 
+// Export cookies from a user's browser context (Playwright context, includes HttpOnly)
+// GET /sessions/:userId/cookies[?tabId=...] -> { ok, cookies: Cookie[], count, userId }
+//
+// Mirrors the session-resolution rules of POST /sessions/:userId/cookies (below):
+//   - tabId query → look up that tab explicitly (404 if missing)
+//   - no tabId    → require a canonical profile + exactly one active session
+//                   (409 with a clear error message otherwise, same as POST)
+//
+// Kept in sync with the POST handler above; changes to the canonical / ambiguous
+// rules must be applied in both places.
+router.get(
+	'/sessions/:userId/cookies',
+	async (
+		req: Request<{ userId: string }, unknown, unknown, { tabId?: unknown }>,
+		res: Response,
+	) => {
+		try {
+			if (CONFIG.apiKey && !isAuthorizedWithApiKey(req as unknown as Request, CONFIG.apiKey)) {
+				return res.status(403).json({ error: 'Forbidden' });
+			}
+
+			const userId = req.params.userId;
+			const tabIdUnknown = req.query.tabId;
+
+			let session: Awaited<ReturnType<typeof getSession>>;
+			if (tabIdUnknown !== undefined) {
+				if (typeof tabIdUnknown !== 'string' || !tabIdUnknown) {
+					return res.status(400).json({ error: 'tabId must be a non-empty string' });
+				}
+				const found = findTabById(tabIdUnknown, userId);
+				if (!found) return res.status(404).json({ error: 'Tab not found' });
+				session = found.session;
+			} else {
+				const canonical = getCanonicalProfile(userId);
+				if (!canonical) {
+					log('warn', 'cookie export rejected: no canonical profile', { userId: String(userId) });
+					return res.status(409).json({
+						error: 'No canonical profile',
+						message:
+							'Cannot export cookies without an established canonical profile. Create a tab via POST /tabs first.',
+					});
+				}
+				const existingSessions = getSessionsForUser(userId);
+				if (existingSessions.length === 0) {
+					log('warn', 'cookie export rejected: no active session', { userId: String(userId) });
+					return res.status(409).json({
+						error: 'No active session',
+						message:
+							'Cannot export cookies without an active session. Create a tab via POST /tabs first.',
+					});
+				}
+				if (existingSessions.length > 1) {
+					log('warn', 'cookie export rejected: ambiguous active sessions', {
+						userId: String(userId),
+						sessionCount: existingSessions.length,
+					});
+					return res.status(409).json({
+						error: 'Ambiguous active sessions',
+						message:
+							'Multiple active browser contexts exist for this user. Provide tabId to export cookies from a specific context.',
+					});
+				}
+				session = existingSessions[0][1];
+			}
+
+			const cookies = await session.context.cookies();
+			const count = Array.isArray(cookies) ? cookies.length : 0;
+			log('info', 'cookies exported', {
+				reqId: req.reqId,
+				userId: String(userId),
+				count,
+			});
+			return res.json({ ok: true, cookies, count, userId: String(userId) });
+		} catch (err) {
+			const message = err instanceof Error ? err.message : String(err);
+			log('error', 'cookie export failed', { reqId: req.reqId, error: message });
+			return res.status(500).json({ error: safeError(err) });
+		}
+	},
+);
+
 // Export cookies from a tab's browser context
+// GET /tabs/:tabId/cookies?userId=...
 router.get(
 	'/tabs/:tabId/cookies',
 	async (req: Request<{ tabId: string }, unknown, unknown, { userId?: unknown }>, res: Response) => {
