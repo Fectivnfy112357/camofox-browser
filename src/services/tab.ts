@@ -96,6 +96,7 @@ type BrowserVoidFunction = () => void;
 // Per-tab locks to serialize operations on the same tab
 // tabId -> Promise (the currently executing operation)
 const tabLocks = new Map<string, Promise<unknown>>();
+const reservedInitialBlankPages = new WeakSet<Page>();
 
 export async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label = 'operation'): Promise<T> {
 	const ms = Math.max(0, Number(timeoutMs) || 0);
@@ -1165,6 +1166,7 @@ async function ensureNavigationSafetyGuard(page: Pick<Page, 'context'>, options:
 function isReusableInitialBlankPage(page: Page): boolean {
 	const taggedPage = page as Page & { __camofox_tabId?: string };
 	if (taggedPage.__camofox_tabId) return false;
+	if (reservedInitialBlankPages.has(page)) return false;
 	if (typeof page.isClosed !== 'function' || page.isClosed()) return false;
 	return page.url() === 'about:blank';
 }
@@ -1175,6 +1177,8 @@ export async function acquirePageForNewTab(context: BrowserContext): Promise<Pag
 	}
 	const pages = context.pages();
 	if (pages.length === 1 && isReusableInitialBlankPage(pages[0])) {
+		// Reserve before returning: callers assign the tab ID after awaiting this function.
+		reservedInitialBlankPages.add(pages[0]);
 		return pages[0];
 	}
 	return context.newPage();

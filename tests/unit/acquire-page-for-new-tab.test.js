@@ -26,6 +26,26 @@ describe('acquirePageForNewTab', () => {
     expect(context.newPage).not.toHaveBeenCalled();
   });
 
+  test('atomically reserves the initial blank page for concurrent tab creation', async () => {
+    const blank = makePage();
+    const created = makePage();
+    const context = {
+      pages: jest.fn(() => [blank]),
+      newPage: jest.fn(async () => created),
+    };
+
+    const { acquirePageForNewTab } = require('../../dist/src/services/tab');
+    const [firstPage, secondPage] = await Promise.all([
+      acquirePageForNewTab(context),
+      acquirePageForNewTab(context),
+    ]);
+
+    expect(firstPage).toBe(blank);
+    expect(secondPage).toBe(created);
+    expect(firstPage).not.toBe(secondPage);
+    expect(context.newPage).toHaveBeenCalledTimes(1);
+  });
+
   test('creates a new page when the only blank page is already tracked', async () => {
     const blank = makePage();
     blank.__camofox_tabId = 'existing-tab';
