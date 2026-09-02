@@ -322,6 +322,177 @@ function validateUrl(url) {
 
 // isLoopbackAddress -- now imported from lib/auth.js (see top of file)
 
+/**
+ * @openapi
+ * /sessions/{userId}/cookies:
+ *   get:
+ *     tags: [Sessions]
+ *     summary: Export cookies from a user's browser context
+ *     description: |
+ *       Returns all cookies for the user's Playwright context (including HttpOnly).
+ *       Mirrors the session-resolution rules of POST /sessions/:userId/cookies:
+ *         - `tabId` query → look up that tab explicitly (404 if missing)
+ *         - no `tabId`    → require an active session for the user
+ *                           (409 with a clear error message otherwise)
+ *       Requires `BearerAuth` in production.
+ *     security:
+ *       - BearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: userId
+ *         required: true
+ *         schema: { type: string }
+ *       - in: query
+ *         name: tabId
+ *         required: false
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Cookies exported.
+ *       403:
+ *         description: Forbidden.
+ *       404:
+ *         description: Tab not found.
+ *       409:
+ *         description: No active session for the user.
+ */
+app.get('/sessions/:userId/cookies', async (req, res) => {
+  try {
+    if (CONFIG.apiKey) {
+      const apiKey = CONFIG.apiKey;
+      const auth = String(req.headers['authorization'] || '');
+      const match = auth.match(/^Bearer\s+(.+)$/i);
+      if (!match || !timingSafeCompare(match[1], apiKey)) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+    } else {
+      const remoteAddress = req.socket?.remoteAddress || '';
+      const allowUnauthedLocal = CONFIG.nodeEnv !== 'production' && isLoopbackAddress(remoteAddress);
+      if (!allowUnauthedLocal) {
+        return res.status(403).json({
+          error:
+            'Cookie export is disabled without CAMOFOX_API_KEY except for loopback requests in non-production environments.',
+        });
+      }
+    }
+
+    const userId = req.params.userId;
+    const tabIdUnknown = req.query.tabId;
+
+    let session;
+    if (tabIdUnknown !== undefined) {
+      if (typeof tabIdUnknown !== 'string' || !tabIdUnknown) {
+        return res.status(400).json({ error: 'tabId must be a non-empty string' });
+      }
+      const key = normalizeUserId(userId);
+      const ownedSession = sessions.get(key);
+      if (!ownedSession) {
+        return tabNotFoundResponse(res, tabIdUnknown);
+      }
+      const found = findTab(ownedSession, tabIdUnknown);
+      if (!found) return tabNotFoundResponse(res, tabIdUnknown);
+      session = ownedSession;
+    } else {
+      const key = normalizeUserId(userId);
+      session = sessions.get(key);
+      if (!session) {
+        log('warn', 'cookie export rejected: no active session', { userId: String(userId) });
+        return res.status(409).json({
+          error: 'No active session',
+          message:
+            'Cannot export cookies without an active session. Create a tab via POST /tabs first.',
+        });
+      }
+    }
+
+    const cookies = await session.context.cookies();
+    const count = Array.isArray(cookies) ? cookies.length : 0;
+    log('info', 'cookies exported', { reqId: req.reqId, userId: String(userId), count });
+    return res.json({ ok: true, cookies, count, userId: String(userId) });
+  } catch (err) {
+    failuresTotal.labels(classifyError(err), 'get_cookies').inc();
+    log('error', 'cookie export failed', { reqId: req.reqId, error: err.message });
+    return res.status(500).json({ error: safeError(err) });
+  }
+});
+
+/**
+ * @openapi
+ * /tabs/{tabId}/cookies:
+ *   get:
+ *     tags: [Tabs]
+ *     summary: Export cookies from a specific tab's browser context
+ *     description: |
+ *       Returns all cookies for the Playwright context that owns the given tab.
+ *       Requires `userId` query parameter to identify the session.
+ *     security:
+ *       - BearerAuth: []
+ *     parameters:
+ *       - in: path
+ *         name: tabId
+ *         required: true
+ *         schema: { type: string }
+ *       - in: query
+ *         name: userId
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Cookies exported.
+ *       400:
+ *         description: userId missing.
+ *       403:
+ *         description: Forbidden.
+ *       404:
+ *         description: Tab not found.
+ */
+app.get('/tabs/:tabId/cookies', async (req, res) => {
+  try {
+    if (CONFIG.apiKey) {
+      const apiKey = CONFIG.apiKey;
+      const auth = String(req.headers['authorization'] || '');
+      const match = auth.match(/^Bearer\s+(.+)$/i);
+      if (!match || !timingSafeCompare(match[1], apiKey)) {
+        return res.status(403).json({ error: 'Forbidden' });
+      }
+    } else {
+      const remoteAddress = req.socket?.remoteAddress || '';
+      const allowUnauthedLocal = CONFIG.nodeEnv !== 'production' && isLoopbackAddress(remoteAddress);
+      if (!allowUnauthedLocal) {
+        return res.status(403).json({
+          error:
+            'Cookie export is disabled without CAMOFOX_API_KEY except for loopback requests in non-production environments.',
+        });
+      }
+    }
+
+    const userId = req.query.userId;
+    const tabId = req.params.tabId;
+    if (typeof userId !== 'string' || !userId) {
+      return res.status(400).json({ error: 'userId query parameter is required' });
+    }
+
+    const key = normalizeUserId(userId);
+    const session = sessions.get(key);
+    if (!session) return tabNotFoundResponse(res, tabId);
+    const found = findTab(session, tabId);
+    if (!found) return tabNotFoundResponse(res, tabId);
+
+    const cookies = await session.context.cookies();
+    log('info', 'cookies exported via tabId', {
+      reqId: req.reqId,
+      userId: String(userId),
+      tabId,
+      count: cookies.length,
+    });
+    return res.json(cookies);
+  } catch (err) {
+    failuresTotal.labels(classifyError(err), 'get_cookies').inc();
+    log('error', 'cookie export failed (tabId)', { reqId: req.reqId, error: err.message });
+    return res.status(500).json({ error: safeError(err) });
+  }
+});
+
 // Import cookies into a user's browser context (Playwright cookies format)
 // POST /sessions/:userId/cookies { cookies: Cookie[] }
 //
