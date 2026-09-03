@@ -69,6 +69,18 @@ find_owned_display() {
 }
 
 while true; do
+  # Bail out when our parent camofox process is gone -- otherwise we hold
+  # port 5900 forever after a browser restart and the next vnc-watcher
+  # retries forever. SERVER_PID is captured at startup; on parent death it
+  # gets re-parented to 1 (init), so we also check that we never became an
+  # orphan. (The "kill -0" check is the only reliable way to detect a
+  # non-PID-1 parent that's gone -- e.g. when supervisord cleans it up.)
+  if [ "$SERVER_PID" -gt 1 ] && ! kill -0 "$SERVER_PID" 2>/dev/null; then
+    log "parent camofox (pid=$SERVER_PID) gone, releasing port $VNC_PORT and exiting"
+    fuser -k "${VNC_PORT}/tcp" 2>/dev/null || true
+    exit 0
+  fi
+
   # A browser restart commonly recreates Xvfb on the same display number.
   # Clear stale state when this watcher's own x11vnc process has exited so the
   # same display can be attached again.
@@ -103,6 +115,10 @@ while true; do
     # shellcheck disable=SC2086
     if ! x11vnc $X11VNC_ARGS; then
       log "x11vnc failed to start on DISPLAY=$CURRENT_DISPLAY; will retry"
+      # Recover: if port is held by an orphan x11vnc from a previous browser
+      # session, free it so the next attempt can bind. Belt-and-suspenders for
+      # the PPID-exit check above (which catches most cases but not all races).
+      fuser -k "${VNC_PORT}/tcp" 2>/dev/null || true
       CURRENT_DISPLAY=""
       sleep 2
       continue
