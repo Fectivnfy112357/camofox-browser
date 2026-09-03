@@ -2784,7 +2784,8 @@ app.get('/health', (req, res) => {
       activeTabs: 0,
       activeSessions: sessions.size,
       memory: { rssMb, heapUsedMb, nativeMemMb },
-      vncPort: process.env.VNC_PORT || '5900',
+      x11vncPort: process.env.VNC_PORT || '5900',
+      novncPort: process.env.NOVNC_PORT || '6080',
       ...(FLY_MACHINE_ID ? { machineId: FLY_MACHINE_ID } : {}),
     });
   }
@@ -2799,7 +2800,8 @@ app.get('/health', (req, res) => {
     consecutiveFailures: Array.from(userNavHealth.values())
       .reduce((sum, h) => sum + h.consecutiveNavFailures, 0),
     memory: { rssMb, heapUsedMb, nativeMemMb },
-    vncPort: process.env.VNC_PORT || '5900',
+    x11vncPort: process.env.VNC_PORT || '5900',
+    novncPort: process.env.NOVNC_PORT || '6080',
     ...(FLY_MACHINE_ID ? { machineId: FLY_MACHINE_ID } : {}),
   });
 });
