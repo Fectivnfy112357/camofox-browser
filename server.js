@@ -8,6 +8,7 @@ import os from 'os';
 import { expandMacro } from './lib/macros.js';
 import { loadConfig } from './lib/config.js';
 import { normalizePlaywrightProxy, createProxyPool, buildProxyUrl } from './lib/proxy.js';
+import { installProxyFetch } from './lib/proxy-fetch.js';
 import { createFlyHelpers } from './lib/fly.js';
 import { createPluginEvents, loadPlugins } from './lib/plugins.js';
 import { requireAuth, accessKeyMiddleware, timingSafeCompare as _timingSafeCompare, isLoopbackAddress as _isLoopbackAddress } from './lib/auth.js';
@@ -118,6 +119,12 @@ function log(level, msg, fields = {}) {
     process.stdout.write(line + '\n');
   }
 }
+
+// --- Route proxy-unaware fetch() through the configured upstream proxy ---
+// camoufox-js downloads the uBlock Origin XPI (and can download browser
+// bundles) with the global fetch(), which ignores HTTP_PROXY on Node 22.
+// Without this, those downloads go out direct and hit geo-blocks (HTTP 451).
+installProxyFetch(CONFIG.proxy, log);
 
 const app = express();
 const globalJsonParser = express.json({ limit: '100kb' });
