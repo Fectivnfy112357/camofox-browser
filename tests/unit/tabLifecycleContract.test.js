@@ -173,5 +173,29 @@ describe('Tab Lifecycle Contract', () => {
         await client.cleanup();
       }
     }, 60000);
+
+    test('a popup that closes itself is deregistered from GET /tabs (#15252)', async () => {
+      const client = createClient(serverUrl);
+      try {
+        const { tabId } = await client.createTab(`${testSiteUrl}/popup-source`);
+        // Open a popup whose page closes itself (window.close()), exactly like an
+        // OAuth consent popup. Before the fix it stayed registered and GET /tabs
+        // kept advertising its dead tabId; now the page 'close' handler drops it.
+        await client.request('POST', `/tabs/${tabId}/evaluate`, {
+          userId: client.userId,
+          expression: "Boolean(window.open('/popup-target?close=1', '_blank'))",
+        });
+        await new Promise(r => setTimeout(r, 2000));
+
+        const tabs = await client.request('GET', `/tabs?userId=${client.userId}`);
+        const popupTab = tabs.tabs.find(t => t.url.includes('/popup-target'));
+        expect(popupTab).toBeUndefined();
+        // The source tab is untouched — only the self-closed popup is gone.
+        const sourceStillThere = tabs.tabs.find(t => t.tabId === tabId);
+        expect(sourceStillThere).toBeDefined();
+      } finally {
+        await client.cleanup();
+      }
+    }, 60000);
   });
 });

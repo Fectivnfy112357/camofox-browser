@@ -6,20 +6,32 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import { expandMacro } from './lib/macros.js';
+import { getSearchFallbacks } from './lib/search-fallbacks.js';
+import { hasGoogleOrganicResults } from './lib/google-serp.js';
 import { loadConfig } from './lib/config.js';
+import { contextIdentityOptions, launchLocale } from './lib/browser-identity.js';
 import { normalizePlaywrightProxy, createProxyPool, buildProxyUrl } from './lib/proxy.js';
 import { installProxyFetch } from './lib/proxy-fetch.js';
 import { createFlyHelpers } from './lib/fly.js';
-import { createPluginEvents, loadPlugins } from './lib/plugins.js';
+import { createPluginEvents, loadPlugins, typeEventPayload } from './lib/plugins.js';
 import { requireAuth, accessKeyMiddleware, timingSafeCompare as _timingSafeCompare, isLoopbackAddress as _isLoopbackAddress } from './lib/auth.js';
+import { createStorageStateExportHandler } from './lib/storage-state.js';
+import { MIN_USABLE_POPUP, POPUP_RESIZE_TARGET, shouldResizePopup } from './lib/popup-sizing.js';
 import { windowSnapshot } from './lib/snapshot.js';
+import { extractPageStructure, extractTableRows, attachStructureRefs } from './lib/page-structure.js';
 import {
   MAX_DOWNLOAD_INLINE_BYTES,
   clearTabDownloads,
   clearSessionDownloads,
   attachDownloadListener,
+  attachNavigationResponseTracker,
+  readInlinePdfResponse,
   clickWithDownloadGuard,
+  captureFetchedResource,
+  MAX_FETCHED_RESOURCE_BYTES,
   getDownloadsList,
+  readDownloadContent,
+  sanitizeFilename,
 } from './lib/downloads.js';
 import { extractPageImages } from './lib/images.js';
 import { extractDeterministic, validateSchema as validateExtractSchema } from './lib/extract.js';
@@ -35,15 +47,27 @@ import {
 import { actionFromReq, classifyError } from './lib/request-utils.js';
 import { cleanupOrphanedTempFiles, cleanupStaleFirefoxProfiles, removeXvfbDisplayFiles } from './lib/tmp-cleanup.js';
 import { coalesceInflight } from './lib/inflight.js';
+import { INTERACTIVE_ROLES } from './lib/interactive-roles.js';
+import { SKIP_PATTERNS, normalizedAccessibleName, annotateAriaSnapshotRefs } from './lib/aria-annotate.js';
+import { selectOption } from './lib/select-option.js';
+import { visibleSelectorCandidate } from './lib/visible-selector.js';
+import { normalizeBrowserKey } from './lib/browser-key.js';
 import { createPageWithSessionRecovery } from './lib/new-page-recovery.js';
 import { resolveUploadPaths } from './lib/upload-paths.js';
+import { runTrustedDrag, trustedDragTimeoutMs, validateTrustedDragRequest } from './lib/trusted-drag.js';
+import { parseWheelParams, resolveViewportCenter } from './lib/interaction-params.js';
 import { acquirePageLease, hasActivePageLeases, isPageLeased, releasePageLease, setLeasedPage } from './lib/page-lease.js';
 import { createReporter, createTabHealthTracker, collectResourceSnapshot, classifyProxyError, browserProcessTreeRssMb, browserProcessNameRssMb } from './lib/reporter.js';
 import { mountDocs } from './lib/openapi.js';
 import { initSentry, captureException as sentryCaptureException, setupExpressErrorHandler as setupSentryErrorHandler, flush as sentryFlush } from './lib/sentry.js';
 import { prepareExternalCamoufoxExecutable } from './lib/camoufox-executable.js';
+import { resolveHostOs } from './lib/fingerprint-os.js';
+import { installViewportTransportShim } from './lib/viewport-transport-shim.js';
+import { createVirtualDisplayRegistry } from './lib/plugin-capabilities.js';
 import { killProcessIds } from './lib/browser-processes.js';
-import { snapshotOwnedBrowserProcesses, survivingOwnedBrowserProcesses } from './lib/process-ownership.js';
+import { createHealthProbe } from './lib/health-probe.js';
+import { snapshotOwnedBrowserProcesses, survivingOwnedBrowserProcesses, completedBrowserProfilePaths } from './lib/process-ownership.js';
+import { killWindowsProcessTree, refreshWindowsProcesses } from './lib/windows-processes.js';
 import {
   safePageUrl, urlDomain, hashIdentifier,
   isDeadContextError, isPageCrashedError, isTimeoutError,
@@ -182,18 +206,9 @@ app.use(accessKeyMiddleware(CONFIG));
 
 const ALLOWED_URL_SCHEMES = ['http:', 'https:'];
 
-// Interactive roles to include - exclude combobox to avoid opening complex widgets
-// (date pickers, dropdowns) that can interfere with navigation
-const INTERACTIVE_ROLES = [
-  'button', 'link', 'textbox', 'checkbox', 'radio',
-  'menuitem', 'tab', 'searchbox', 'slider', 'spinbutton', 'switch'
-  // 'combobox' excluded - can trigger date pickers and complex dropdowns
-];
+// Accessible control roles are defined in lib/interactive-roles.js.
 
-// Patterns to skip (date pickers, calendar widgets -- NOT expiration/expiry fields)
-const SKIP_PATTERNS = [
-  /datepicker/i, /date.?picker/i, /calendar/i, /^date$/i
-];
+// SKIP_PATTERNS (date pickers / calendar widgets) now live in lib/aria-annotate.js.
 
 // Iframe support: URL patterns to SKIP (tracking, analytics, pixels)
 const IFRAME_SKIP_PATTERNS = [
@@ -655,7 +670,170 @@ app.post('/sessions/:userId/cookies', express.json({ limit: '512kb' }), async (r
   }
 });
 
+/**
+ * @openapi
+ * /sessions/{userId}/storage_state:
+ *   get:
+ *     tags: [Sessions]
+ *     summary: Export a session's storage state
+ *     description: Return the live Playwright storage state (cookies + per-origin localStorage) for an active session. Contains authenticated material; requires auth and must not be logged by callers.
+ *     parameters:
+ *       - name: userId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Storage state (cookies and origins).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *       404:
+ *         description: No active session for the user.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.get('/sessions/:userId/storage_state', authMiddleware(), (req, res) => createStorageStateExportHandler({
+  sessions,
+  normalizeUserId,
+  events: pluginEvents,
+  log,
+})(req, res));
+
+/**
+ * @openapi
+ * /sessions/{userId}/local-storage:
+ *   post:
+ *     tags: [Sessions]
+ *     summary: Import localStorage into a session
+ *     description: Seed per-origin localStorage for a session by visiting each declared origin and writing the entries. Origins must be unique HTTP/HTTPS origins without credentials (max 20); each origin may carry up to 500 entries.
+ *     parameters:
+ *       - name: userId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [origins]
+ *             properties:
+ *               origins:
+ *                 type: array
+ *                 items:
+ *                   type: object
+ *                   required: [origin, localStorage]
+ *                   properties:
+ *                     origin:
+ *                       type: string
+ *                     localStorage:
+ *                       type: array
+ *                       items:
+ *                         type: object
+ *                         required: [name, value]
+ *                         properties:
+ *                           name:
+ *                             type: string
+ *                           value:
+ *                             type: string
+ *     responses:
+ *       200:
+ *         description: Import result.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *       400:
+ *         description: Invalid request body.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       500:
+ *         description: Import failed.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.post('/sessions/:userId/local-storage', authMiddleware(), express.json({ limit: '512kb' }), async (req, res) => {
+  try {
+    const origins = req.body?.origins;
+    if (!Array.isArray(origins) || origins.length === 0 || origins.length > 20) {
+      return res.status(400).json({ error: 'origins must be a nonempty array with at most 20 entries' });
+    }
+    const seenOrigins = new Set();
+    let entries = 0;
+    for (const item of origins) {
+      if (!item || typeof item !== 'object' || typeof item.origin !== 'string' || !Array.isArray(item.localStorage)) {
+        return res.status(400).json({ error: 'Each origin must include origin and localStorage' });
+      }
+      let parsed;
+      try { parsed = new URL(item.origin); } catch { return res.status(400).json({ error: 'Invalid local-storage origin' }); }
+      if (!['http:', 'https:'].includes(parsed.protocol) || parsed.origin !== item.origin || parsed.username || parsed.password || seenOrigins.has(item.origin)) {
+        return res.status(400).json({ error: 'Each local-storage origin must be a unique HTTP or HTTPS origin without credentials' });
+      }
+      seenOrigins.add(item.origin);
+      if (item.localStorage.length > 500 || item.localStorage.some(entry => !entry || typeof entry !== 'object' || typeof entry.name !== 'string' || !entry.name || typeof entry.value !== 'string')) {
+        return res.status(400).json({ error: 'Each localStorage entry must include a nonempty name and a string value; maximum 500 per origin' });
+      }
+      entries += item.localStorage.length;
+    }
+
+    const session = await getSession(req.params.userId);
+    for (const item of origins) {
+      const lease = acquirePageLease(session);
+      const page = setLeasedPage(lease, await session.context.newPage());
+      try {
+        await page.goto(item.origin, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+        if (new URL(page.url()).origin !== item.origin) {
+          return res.status(400).json({ error: 'Local-storage origin redirected outside its declared origin' });
+        }
+        const imported = await page.evaluate((localStorageEntries) => {
+          localStorage.clear();
+          for (const { name, value } of localStorageEntries) localStorage.setItem(name, value);
+          return localStorageEntries.every(({ name, value }) => localStorage.getItem(name) === value)
+            && localStorage.length === localStorageEntries.length;
+        }, item.localStorage);
+        if (!imported) throw new Error('Browser did not retain imported local storage');
+      } finally {
+        await safePageClose(page);
+        releasePageLease(session, lease);
+      }
+    }
+    const result = { ok: true, userId: String(req.params.userId), origins: origins.length, entries };
+    log('info', 'local storage imported', { reqId: req.reqId, userId: result.userId, origins: result.origins, entries });
+    res.json(result);
+  } catch (err) {
+    failuresTotal.labels(classifyError(err), 'set_local_storage').inc();
+    log('error', 'local-storage import failed', { reqId: req.reqId, error: err.message });
+    res.status(500).json({ error: safeError(err) });
+  }
+});
+
 let browser = null;
+// True only when the viewport transport shim (lib/viewport-transport-shim.js)
+// successfully wrapped the live Juggler transport at launch. viewport /
+// deviceScaleFactor features are only safe to advertise & accept while this is
+// true; otherwise Camoufox rejects the protocol calls with a raw error.
+let viewportShimInstalled = false;
+// True only when the browser was launched HEADED (virtual display / VNC, or a
+// real desktop window). Used to decide whether a window.open() popup that came
+// up with a tiny native window should be nudged to a usable size. Headless
+// popups are never resized -- they have no native chrome to be cramped by, and
+// resizing them would only add a fingerprint tell. Set in the launch path right
+// next to viewportShimInstalled.
+let browserLaunchedHeaded = false;
+// Popup sizing policy (constants + pure predicate) lives in lib/popup-sizing.js
+// so it can be unit-tested in isolation: MIN_USABLE_POPUP, POPUP_RESIZE_TARGET,
+// shouldResizePopup.
 let _lastBrowserPid = null; // Track PID independently for force-kill after close
 let _browserClosePromise = null; // Shared promise for concurrent close serialization
 let _lastBrowserRestartAt = 0; // Timestamp of last browser relaunch (for stale tab detection)
@@ -675,6 +853,10 @@ const NEW_PAGE_TIMEOUT_MS = CONFIG.newPageTimeoutMs;
 const MAX_CONCURRENT_PER_USER = CONFIG.maxConcurrentPerUser;
 const PAGE_CLOSE_TIMEOUT_MS = 5000;
 const PAGE_FORCE_CLOSE_TIMEOUT_MS = 1000;
+// Upper bound on BrowserContext.close() during session teardown. getSession()
+// awaits any in-flight teardown for a user, so an unbounded close could wedge
+// every future request for that user. 10s comfortably exceeds a healthy close.
+const CONTEXT_CLOSE_TIMEOUT_MS = 10000;
 const NAVIGATE_TIMEOUT_MS = CONFIG.navigateTimeoutMs;
 const BUILDREFS_TIMEOUT_MS = CONFIG.buildrefsTimeoutMs;
 const NATIVE_MEM_RESTART_THRESHOLD_MB = CONFIG.nativeMemRestartThresholdMb;
@@ -682,6 +864,7 @@ let _nativeMemBaseline = null; // RSS - heapUsed at first idle measurement
 const FAILURE_THRESHOLD = 3;
 const MAX_CONSECUTIVE_TIMEOUTS = 3;
 const TAB_LOCK_TIMEOUT_MS = 35000; // Must be > HANDLER_TIMEOUT_MS so active op times out first
+const EVALUATE_MAX_TIMEOUT_MS = 15 * 60 * 1000; // ceiling for a caller's evaluate timeoutMs
 
 
 
@@ -744,20 +927,30 @@ function getTabLock(tabId) {
 }
 
 // Timeout is INSIDE the lock so each operation gets its full budget
-// regardless of how long it waited in the queue.
+// regardless of how long it waited in the queue. When an operation times out we
+// keep its lock held until the underlying promise actually settles, so later
+// queued work cannot overlap with a still-running (zombie) Playwright operation
+// and corrupt CDP state.
 async function withTabLock(tabId, operation, timeoutMs = HANDLER_TIMEOUT_MS, onTimeout) {
   const lock = getTabLock(tabId);
   await lock.acquire(TAB_LOCK_TIMEOUT_MS);
+  const operationPromise = Promise.resolve().then(operation);
+  let releaseOnSettlement = false;
   try {
-    return await withTimeout(operation(), timeoutMs, 'action');
+    return await withTimeout(operationPromise, timeoutMs, 'action');
   } catch (err) {
+    if (isTimeoutError(err)) {
+      // Do not release until the real operation finishes; let it drain the lock.
+      releaseOnSettlement = true;
+      operationPromise.finally(() => lock.release()).catch(() => {});
+    }
     if (onTimeout && isTimeoutError(err)) {
       await onTimeout();
       throw Object.assign(err, { code: 'tab_timeout', statusCode: 410 });
     }
     throw err;
   } finally {
-    lock.release();
+    if (!releaseOnSettlement) lock.release();
   }
 }
 
@@ -772,6 +965,65 @@ function withTimeout(promise, ms, label) {
 
 function requestTimeoutMs(baseMs = HANDLER_TIMEOUT_MS) {
   return proxyPool?.canRotateSessions ? Math.max(baseMs, 180000) : baseMs;
+}
+
+function navigationRequestTimeoutMs() {
+  return Math.max(requestTimeoutMs(), NAVIGATE_TIMEOUT_MS + 5000);
+}
+
+// A tab creation can make one bounded new-page attempt, rebuild the browser
+// session, then make one more. Keep the route deadline outside that recovery
+// budget so a healthy replacement session can return its tab.
+function tabCreateRequestTimeoutMs() {
+  return Math.max(requestTimeoutMs(), (NEW_PAGE_TIMEOUT_MS * 2) + 5000);
+}
+
+// One-time extra budget granted to the first POST /tabs after an idle shutdown
+// when a cold context build is still coalescing for this user. The base budget
+// (~30s by default) covers a quiet-host cold start (~8.2s) and a single heavy
+// storage-state restore, but two concurrent first-hits that coalesce onto one
+// build can push the restore to ~25-30s and overshoot the base deadline by a
+// hair even though the build finishes microseconds later. We grant one extra
+// budget on the order of the base (another ~30s) so that heavier restore lands
+// instead of returning a lying 500/503. Worst case the route waits ~60s total;
+// if even that is exceeded (a true pile-up) we fall back to a retriable 503.
+const TAB_CREATE_BUILD_EXTENSION_MS = 30000;
+
+// True only for the outer `withTimeout(..., 'tab create')` deadline firing — the
+// message shape produced by withTimeout() with the 'tab create' label. Inner
+// operation timeouts (new_page_timeout, 'context close', etc.) carry other
+// labels/codes and must NOT be treated as the route deadline.
+function isTabCreateDeadlineTimeout(err) {
+  return isTimeoutError(err) &&
+    typeof err?.message === 'string' &&
+    err.message.startsWith('tab create timed out after') &&
+    err.code !== 'new_page_timeout';
+}
+
+// The service cgroup's memory against its systemd MemoryHigh (else MemoryMax); null off cgroup v2.
+// Sitting near the cap is normal (cache fills it, swap absorbs anon); stalling there is what
+// makes new pages time out, so atCap also needs the kernel's memory pressure (PSI).
+function cgroupMemory() {
+  try {
+    const rel = fs.readFileSync('/proc/self/cgroup', 'utf8').match(/^0::(.*)$/m)?.[1];
+    if (!rel) return null;
+    const read = (name) => fs.readFileSync(`/sys/fs/cgroup${rel}/${name}`, 'utf8').trim();
+    const mb = (v) => (v === 'max' ? null : Math.round(Number(v) / 1048576));
+    const usedMb = mb(read('memory.current'));
+    const capMb = mb(read('memory.high')) ?? mb(read('memory.max'));
+    const stalledPct = Number(read('memory.pressure').match(/^some avg10=([\d.]+)/m)?.[1] ?? 0);
+    const nearCap = capMb !== null && usedMb >= capMb * 0.95;
+    return { usedMb, capMb, stalledPct, nearCap, atCap: nearCap && stalledPct >= 20 };
+  } catch {
+    return null;
+  }
+}
+
+function memoryCapResponse(res, mem) {
+  return res.status(503).json({
+    error: `Camofox is at its memory cap (${mem.usedMb} of ${mem.capMb} MB, ${mem.stalledPct}% stalled); close tabs or raise MemoryHigh`,
+    code: 'memory_cap_reached', retryable: false, memory: mem,
+  });
 }
 
 const userConcurrency = new Map();
@@ -827,12 +1079,9 @@ async function safePageClose(page) {
   }
 }
 
-// Detect host OS for fingerprint generation
+// Detect host OS for fingerprint generation (CAMOFOX_OS overrides it)
 function getHostOS() {
-  const platform = os.platform();
-  if (platform === 'darwin') return 'macos';
-  if (platform === 'win32') return 'windows';
-  return 'linux';
+  return resolveHostOs(CONFIG.fingerprintOs, os.platform());
 }
 
 // Proxy strategy for outbound browsing.
@@ -863,7 +1112,7 @@ let _lastBrowserStopReason = null;
 const INTENTIONAL_STOP_REASONS = new Set(['idle_shutdown', 'admin_stop']);
 
 function scheduleBrowserIdleShutdown() {
-  if (browserIdleTimer || sessions.size > 0 || !browser) return;
+  if (browserIdleTimer || sessions.size > 0 || !browser || BROWSER_IDLE_TIMEOUT_MS <= 0) return;
   browserIdleTimer = setTimeout(async () => {
     browserIdleTimer = null;
     if (sessions.size === 0 && browser) {
@@ -935,6 +1184,12 @@ const healthState = {
   activeOps: 0,
   lastSuccessfulNav: Date.now(),
 };
+
+// One long-lived probe context. `newContext` is a thunk, not a bound value:
+// `browser` is reassigned by restartBrowser(), and the probe must follow it.
+const healthProbe = createHealthProbe({
+  newContext: () => browser.newContext({ viewport: null }),
+});
 
 function getUserNavHealth(userId) {
   const key = normalizeUserId(userId);
@@ -1063,30 +1318,6 @@ function getExternalCamoufoxLaunch() {
   return externalCamoufoxLaunch;
 }
 
-async function probeGoogleSearch(candidateBrowser) {
-  let context = null;
-  try {
-    context = await candidateBrowser.newContext({
-      viewport: null,
-      permissions: ['geolocation'],
-    });
-    const page = await context.newPage();
-    await page.goto('https://www.google.com/', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(1200);
-    await page.goto('https://www.google.com/search?q=weather%20today', { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(4000);
-
-    const blocked = await isGoogleSearchBlocked(page);
-    return {
-      ok: !blocked && isGoogleSerp(page.url()),
-      url: page.url(),
-      blocked,
-    };
-  } finally {
-    await context?.close().catch(() => {});
-  }
-}
-
 function attachBrowserCleanup(candidateBrowser, localVirtualDisplay) {
   const origClose = candidateBrowser.close.bind(candidateBrowser);
   candidateBrowser.close = async (...args) => {
@@ -1141,11 +1372,13 @@ async function _closeBrowserFullyImpl(reason) {
 
   // Close through Playwright (sends CDP Browser.close, then SIGKILL process group)
   let closeTimer;
+  let closed = false;
   try {
     await Promise.race([
       b.close(),
       new Promise((_, reject) => { closeTimer = setTimeout(() => reject(new Error('browser.close() timeout')), 10000); }),
     ]);
+    closed = true;
   } catch (err) {
     log('warn', 'browser.close() failed or timed out', { reason, error: err.message, pid });
   } finally {
@@ -1154,13 +1387,14 @@ async function _closeBrowserFullyImpl(reason) {
 
   // Force-kill only survivors captured before this close began.
   if (pid) {
-    await _forceKillProcessTree(pid, reason);
+    await _forceKillProcessTree(pid, reason, ownedBrowserProcesses);
   }
   await _forceKillBrowserProcesses(reason, ownedBrowserProcesses);
 
   // Clean up stale Firefox temp profiles (enable_cache: true accumulates data)
   try {
-    const cleaned = cleanupStaleFirefoxProfiles();
+    const ownedPaths = completedBrowserProfilePaths(ownedBrowserProcesses, closed);
+    const cleaned = cleanupStaleFirefoxProfiles({ ownedPaths });
     if (cleaned.removed > 0) {
       log('info', 'cleaned stale firefox profiles after browser close', cleaned);
     }
@@ -1193,8 +1427,17 @@ async function _closeBrowserFullyImpl(reason) {
  * (SIGKILL -pid). Orphan cleanup is deliberately left to the ownership
  * snapshot captured before browser.close(), below.
  */
-async function _forceKillProcessTree(pid, reason) {
+async function _forceKillProcessTree(pid, reason, ownedBrowserProcesses = []) {
   if (!pid || pid <= 1) return;
+
+  if (process.platform === 'win32') {
+    const rootSnapshot = ownedBrowserProcesses.find((proc) => proc.pid === pid);
+    if (rootSnapshot && killWindowsProcessTree(pid, { expectedStartTime: rootSnapshot.startTime })) {
+      log('info', 'killed browser process tree', { pid, reason });
+    }
+    await new Promise(r => setTimeout(r, 500));
+    return;
+  }
 
   // Kill the specific browser process first (positive PID = single process)
   try {
@@ -1223,18 +1466,15 @@ async function _forceKillProcessTree(pid, reason) {
 }
 
 async function _forceKillBrowserProcesses(reason, ownedBrowserProcesses = []) {
-  if (process.platform !== 'linux') return;
-  let victims = [];
   try {
-    victims = survivingOwnedBrowserProcesses(ownedBrowserProcesses).map(proc => proc.pid);
+    const survivors = survivingOwnedBrowserProcesses(ownedBrowserProcesses);
+    const victims = survivors.map(proc => proc.pid);
+    if (victims.length > 0) {
+      log('warn', 'killing browser survivor processes', { reason, victims });
+      await killProcessIds(victims, { signal: 'SIGKILL', delayMs: 300, processSnapshots: survivors });
+    }
   } catch (err) {
     log('warn', 'failed to scan for browser survivor processes', { reason, error: err.message });
-    return;
-  }
-
-  if (victims.length > 0) {
-    log('warn', 'killing browser survivor processes', { reason, victims });
-    await killProcessIds(victims, { signal: 'SIGKILL', delayMs: 300 });
   }
 }
 
@@ -1247,6 +1487,29 @@ function _countOpenFds() {
 
 function _countActiveHandles() {
   try { return process._getActiveHandles().length; } catch { return null; }
+}
+
+const GEOIP_SETUP_TIMEOUT_MS = 10000;
+
+function isCamoufoxGeoipError(err) {
+  return /Invalid locale:|GeoLite|MaxMind|geolocation|public proxy IP address|GeoIP setup timed out/i.test(err?.message || String(err || ''));
+}
+
+const virtualDisplayRegistry = createVirtualDisplayRegistry(() => new DefaultVirtualDisplay());
+
+async function buildLaunchOptionsWithGeoipFallback(baseOptions, attemptMeta) {
+  try {
+    return await withTimeout(launchOptions(baseOptions), GEOIP_SETUP_TIMEOUT_MS, 'GeoIP setup');
+  } catch (err) {
+    if (!baseOptions.geoip || !isCamoufoxGeoipError(err)) {
+      throw err;
+    }
+    log('warn', 'camoufox geoip setup failed; retrying launch options without geoip', {
+      ...attemptMeta,
+      error: err.message,
+    });
+    return await launchOptions({ ...baseOptions, geoip: false });
+  }
 }
 
 async function launchBrowserInstance() {
@@ -1266,7 +1529,7 @@ async function launchBrowserInstance() {
     let candidateBrowser = null;
     try {
       if (os.platform() === 'linux' && !useDesktopWindow) {
-        localVirtualDisplay = pluginCtx.createVirtualDisplay();
+        localVirtualDisplay = virtualDisplayRegistry.create();
         vdDisplay = await localVirtualDisplay.get();
         log('info', 'xvfb virtual display started', { display: vdDisplay, attempt });
       }
@@ -1295,7 +1558,7 @@ async function launchBrowserInstance() {
           excludeAddons: ['UBO'],
         });
       }
-      const options = await launchOptions({
+      const options = await buildLaunchOptionsWithGeoipFallback({
         executable_path: externalCamoufox?.executablePath,
         headless: useVirtualDisplay ? false : !useDesktopWindow,
         os: hostOS,
@@ -1303,8 +1566,13 @@ async function launchBrowserInstance() {
         enable_cache: true,
         proxy: launchProxy,
         geoip: !!launchProxy,
+        locale: launchLocale({ hasProxy: !!proxyPool, directIdentity: CONFIG.directIdentity }),
         virtual_display: vdDisplay,
         exclude_addons: CONFIG.disableDefaultAddons ? ['UBO'] : undefined,
+      }, {
+        attempt,
+        proxyServer: launchProxy?.server || null,
+        proxySession: launchProxy?.sessionId || null,
       });
       options.proxy = normalizePlaywrightProxy(options.proxy);
       // Playwright's launcher defaults handleSIGTERM/SIGINT/SIGHUP to true,
@@ -1320,33 +1588,24 @@ async function launchBrowserInstance() {
 
       candidateBrowser = await firefox.launch(options);
 
-      if (proxyPool?.canRotateSessions) {
-        const probe = await probeGoogleSearch(candidateBrowser);
-        if (!probe.ok) {
-          log('warn', 'browser launch google probe failed', {
-            attempt,
-            maxAttempts,
-            proxySession: launchProxy?.sessionId || null,
-            url: probe.url,
-          });
-          if (attempt < maxAttempts) {
-            await candidateBrowser.close().catch(() => {});
-            if (localVirtualDisplay) localVirtualDisplay.kill();
-            continue;
-          }
-          // Last attempt: accept browser in degraded mode rather than death-spiraling.
-          // Non-Google sites will still work; Google requests will get blocked responses.
-          log('error', 'all proxy sessions Google-blocked, accepting browser in degraded mode', {
-            maxAttempts,
-            proxySession: launchProxy?.sessionId || null,
-          });
-        }
-      }
-
+      // Browser startup must remain site-agnostic. Google-specific blocking is
+      // handled by the Google navigation/snapshot rotation paths below; gating
+      // every cold start on a Google probe makes unrelated sites unavailable
+      // whenever the proxy provider's current Google reputation is poor.
       virtualDisplay = localVirtualDisplay;
       browserLaunchProxy = launchProxy;
       _lastBrowserPid = candidateBrowser.process?.()?.pid ?? null;
       browser = candidateBrowser; // publish AFTER PID is captured
+      // Wrap the live Juggler transport exactly once so Playwright 1.62's extra
+      // isMobile/screenSize fields are stripped before Camoufox 152 sees them.
+      // Only when this succeeds do we advertise/accept viewport features.
+      viewportShimInstalled = installViewportTransportShim(browser, log);
+      // Record whether this launch is headed. headless was set above to
+      // (useVirtualDisplay ? false : !useDesktopWindow), so the browser is
+      // headed exactly when a virtual display (Xvfb/VNC) or a desktop window is
+      // in use. attachPopupHandler consults this to decide if a cramped popup
+      // should be nudged to a usable size.
+      browserLaunchedHeaded = useVirtualDisplay || useDesktopWindow;
       _lastBrowserStopReason = null; // clear — browser is healthy
       _lastBrowserRestartAt = Date.now();
       attachBrowserCleanup(browser, localVirtualDisplay);
@@ -1407,6 +1666,7 @@ function normalizeUserId(userId) {
 }
 
 const sessionCreations = new Map();
+const sessionTeardowns = new Map();
 
 function clearSessionLocks(session) {
   if (!session?.tabGroups) return;
@@ -1422,13 +1682,36 @@ function clearSessionLocks(session) {
   refreshTabLockQueueDepth();
 }
 
-async function closeSession(userId, session, {
+// Per-user coalescing wrapper: a session can be torn down from several places
+// at once (API delete, idle timeout, dead-context sweep, and — since the
+// memory-pressure watchdog became async — overlapping 30s ticks). Running two
+// teardowns on the same session races the session:destroying checkpoint and
+// double-counts metrics. Serialize per userId so each session closes exactly
+// once; concurrent callers await the same promise.
+async function closeSession(userId, session, options = {}) {
+  if (!session) return;
+  const key = normalizeUserId(userId);
+  const existing = sessionTeardowns.get(key);
+  if (existing) {
+    if (existing.session === session) return existing.promise;
+    await existing.promise.catch(() => {});
+  }
+  session._closing = true;
+  const entry = { session, promise: null };
+  entry.promise = closeSessionImpl(key, session, options);
+  sessionTeardowns.set(key, entry);
+  try {
+    return await entry.promise;
+  } finally {
+    if (sessionTeardowns.get(key) === entry) sessionTeardowns.delete(key);
+  }
+}
+
+async function closeSessionImpl(userId, session, {
   reason = 'session_closed',
   clearDownloads = true,
   clearLocks = true,
 } = {}) {
-  if (!session) return;
-
   const key = normalizeUserId(userId);
 
   // Drain locks BEFORE closing context — queued operations get clean "Tab destroyed"
@@ -1451,7 +1734,13 @@ async function closeSession(userId, session, {
     }
   }
 
-  await session.context.close().catch(() => {});
+  // Bound the close: a hung context.close() would otherwise leave this teardown
+  // promise unresolved forever, and because getSession() awaits any in-flight
+  // teardown for a user, every future request for that user would block behind
+  // it. On timeout we abandon the close (the context is being discarded anyway)
+  // and let teardown finish so a fresh session can be built.
+  await withTimeout(session.context.close(), CONTEXT_CLOSE_TIMEOUT_MS, 'context close')
+    .catch((err) => { log('warn', 'context close did not settle', { userId: key, error: err.message }); });
   sessions.delete(key);
   await pluginEvents.emitAsync('session:destroyed', { userId: key, reason });
 
@@ -1467,6 +1756,10 @@ async function closeAllSessions(reason, { clearDownloads = true, clearLocks = tr
 
 async function getSession(userId, { trace = false } = {}) {
   const key = normalizeUserId(userId);
+  // If a teardown for this user is in flight, wait for it so we never hand back
+  // or rebuild on top of a session that is mid-close.
+  const pendingTeardown = sessionTeardowns.get(key);
+  if (pendingTeardown) await pendingTeardown.promise.catch(() => {});
   let session = sessions.get(key);
   
   // Check if existing session's context is still alive
@@ -1488,6 +1781,12 @@ async function getSession(userId, { trace = false } = {}) {
   
   if (!session) {
     session = await coalesceInflight(sessionCreations, key, async () => {
+      // A teardown may have started between the check above and here; wait it
+      // out and reuse a live replacement if one appeared.
+      const inflightTeardown = sessionTeardowns.get(key);
+      if (inflightTeardown) await inflightTeardown.promise.catch(() => {});
+      const replacement = sessions.get(key);
+      if (replacement && !replacement._closing) return replacement;
       if (sessions.size >= MAX_SESSIONS) {
         throw Object.assign(
           new Error('Maximum concurrent sessions reached'),
@@ -1514,15 +1813,11 @@ async function getSession(userId, { trace = false } = {}) {
       const b = await ensureBrowser();
       const contextOptions = {
         viewport: null,
-        permissions: ['geolocation'],
+        ...contextIdentityOptions({
+          hasProxy: !!proxyPool,
+          directIdentity: CONFIG.directIdentity,
+        }),
       };
-      // When geoip is active (proxy configured), camoufox auto-configures
-      // locale/timezone/geolocation from the proxy IP. Without proxy, use defaults.
-      if (!CONFIG.proxy.host) {
-        contextOptions.locale = 'en-US';
-        contextOptions.timezoneId = 'America/Los_Angeles';
-        contextOptions.geolocation = { latitude: 37.7749, longitude: -122.4194 };
-      }
       let sessionProxy = null;
       if (proxyPool?.canRotateSessions) {
         sessionProxy = proxyPool.getNext(`ctx-${key}-${crypto.randomUUID().replace(/-/g, '').slice(0, 8)}`);
@@ -1610,12 +1905,23 @@ function getTabGroup(session, listItemId) {
   return group;
 }
 
+// Drop an emptied group only while its key still maps to it. A cleanup that
+// awaited page close can resume after another cleanup dropped the group and a
+// new tab registered a replacement group under the same key.
+function dropEmptyTabGroup(session, listItemId, group) {
+  if (group.size === 0 && session.tabGroups.get(listItemId) === group) {
+    session.tabGroups.delete(listItemId);
+  }
+}
+
 // Centralized error handler for route catch blocks.
 // Auto-destroys dead browser sessions and returns appropriate status codes.
 function isProxyError(err) {
   if (!err) return false;
   const msg = err.message || '';
-  return msg.includes('NS_ERROR_PROXY') || msg.includes('proxy connection') || msg.includes('Proxy connection');
+  return msg.includes('NS_ERROR_PROXY') || msg.includes('proxy connection') || msg.includes('Proxy connection') ||
+    msg.includes('NS_ERROR_CONNECTION_REFUSED') || msg.includes('NS_ERROR_NET_RESET') ||
+    msg.includes('NS_ERROR_NET_TIMEOUT') || msg.includes('NS_ERROR_UNKNOWN_HOST');
 }
 
 function handleRouteError(err, req, res, extraFields = {}) {
@@ -1657,7 +1963,42 @@ function handleRouteError(err, req, res, extraFields = {}) {
     return res.status(410).json({ error: 'Page crashed. Open a new tab.', code: 'page_crashed', retryable: true, recovery: 'create_new_tab', ...extraFields });
   }
   if (userId && isDeadContextError(err)) {
-    destroySession(userId).catch(() => {});
+    // "Target page, context or browser has been closed" is raised both when the
+    // whole BrowserContext dies AND when a single page closed itself (an OAuth
+    // popup calling window.close(), a site-initiated close). Destroying the
+    // session on the second case wipes every tab across ALL sessionKey groups
+    // for this user. Before tearing anything down, probe the context: if it is
+    // still alive, this is a closed-page error, so drop only the offending tab
+    // (if the self-close handler has not already deregistered it) and return a
+    // recoverable per-tab error.
+    const key = normalizeUserId(userId);
+    const session = sessions.get(key);
+    let contextAlive = false;
+    if (session && !session._closing) {
+      try { session.context.pages(); contextAlive = true; } catch { contextAlive = false; }
+    }
+    const found = contextAlive && tabId ? findTab(session, tabId) : null;
+    // Attribute to a closed page when the tab is gone (already deregistered) or
+    // its page reports closed. If the tab's page is somehow still open on a live
+    // context, we do not know what happened — leave the session intact and let
+    // the generic error response below handle it rather than destroy everything.
+    const pageOnlyClosed = contextAlive && Boolean(tabId) &&
+      (!found || Boolean(found.tabState.page?.isClosed?.()));
+    if (contextAlive) {
+      if (found && found.tabState.page?.isClosed?.()) {
+        destroyTab(session, tabId, 'page_self_closed', userId);
+      }
+      if (pageOnlyClosed) {
+        return res.status(404).json({
+          error: 'Tab not found (its page was closed). Open a new tab.',
+          code: 'tab_closed', retryable: true, recovery: 'create_new_tab', ...extraFields,
+        });
+      }
+      // Live context but not attributable to a tab close: do not destroy the
+      // session. Fall through to the generic error response.
+    } else {
+      destroySession(userId).catch(() => {});
+    }
   }
   // Proxy errors mean the session is dead -- rotate at context level.
   // Destroy the user's session so the next request gets a fresh context with a new proxy.
@@ -1672,14 +2013,37 @@ function handleRouteError(err, req, res, extraFields = {}) {
   // the connection open for 30s). The browser context shares a single proxy session, so
   // one poisoned page kills all subsequent navigations in that context. Destroy the
   // entire session so the next request gets a fresh BrowserContext + proxy.
+  //
+  // Guarded on proxyPool?.canRotateSessions, exactly as the proxy-error branch above
+  // is. Proxy poisoning is the whole justification for destroying a session here, so
+  // when no proxy is configured there is nothing to rotate and the teardown costs
+  // every tab under that userId for no benefit -- subsequent calls get 404 "Tab not
+  // found". #8559 reported that blast radius: one caller's timeout killing every
+  // concurrent tab, because parallel callers share a userId. v1.14.0 fixed the
+  // trigger described there (bare image URLs now complete at commit) but left the
+  // radius, so any other timeout -- a slow page, a hung connection -- still takes the
+  // whole session.
+  //
+  // Without a proxy, the per-tab consecutive-timeout reaper below is the right
+  // granularity and still collects a genuinely stuck tab. recordNavFailure is kept on
+  // both paths so session health tracking is unchanged either way.
   const NAVIGATION_TIMEOUT_ACTIONS = new Set(['click', 'navigate', 'open_url']);
-  if (isTimeoutError(err) && err.code !== 'tab_timeout' && userId && NAVIGATION_TIMEOUT_ACTIONS.has(action)) {
+  // A responsive new-page timeout is not a navigation failure and must keep
+  // the existing session (and its tabs) available for the retry.
+  const isNavigationTimeout =
+    isTimeoutError(err) && err.code !== 'tab_timeout' && err.code !== 'new_page_timeout' && userId && NAVIGATION_TIMEOUT_ACTIONS.has(action);
+  if (isNavigationTimeout && proxyPool?.canRotateSessions) {
     log('warn', 'navigation timeout — destroying session for fresh proxy', {
       action, userId, error: err.message,
     });
     browserRestartsTotal.labels('navigation_timeout').inc();
     recordNavFailure(userId);
     destroySession(userId).catch(() => {});
+  } else if (isNavigationTimeout) {
+    log('warn', 'navigation timeout — no proxy to rotate, leaving the session up', {
+      action, userId, error: err.message,
+    });
+    recordNavFailure(userId);
   }
   // Track consecutive timeouts per tab and auto-destroy stuck tabs
   // (for non-navigation timeouts like type, scroll that don't poison the proxy)
@@ -1790,7 +2154,7 @@ async function destroyTimedOutTab(session, tabId, reason, userId) {
     log('warn', 'timed-out tab cleanup failed', { tabId, error: err.message });
   } finally {
     group.delete(tabId);
-    if (group.size === 0) session.tabGroups.delete(listItemId);
+    dropEmptyTabGroup(session, listItemId, group);
     const lock = tabLocks.get(tabId);
     if (lock) {
       lock.drain();
@@ -1803,31 +2167,26 @@ async function destroyTimedOutTab(session, tabId, reason, userId) {
   }
 }
 
-/**
- * Recycle the oldest (least-used) tab in a session to free a slot.
- * Closes the old tab's page and removes it from its group.
- * Returns { recycledTabId, recycledFromGroup } or null if no tab to recycle.
- */
-async function recycleOldestTab(session, reqId, userId) {
+async function recycleOldestTab(session, reqId, userId, sessionKey) {
   let oldestTab = null;
   let oldestGroup = null;
   let oldestGroupKey = null;
   let oldestTabId = null;
-  for (const [gKey, group] of session.tabGroups) {
-    for (const [tid, ts] of group) {
-      if (!oldestTab || ts.toolCalls < oldestTab.toolCalls) {
-        oldestTab = ts;
-        oldestGroup = group;
-        oldestGroupKey = gKey;
-        oldestTabId = tid;
-      }
+  const group = session.tabGroups.get(sessionKey);
+  if (!group) return null;
+  for (const [tid, ts] of group) {
+    if (!oldestTab || ts.toolCalls < oldestTab.toolCalls) {
+      oldestTab = ts;
+      oldestGroup = group;
+      oldestGroupKey = sessionKey;
+      oldestTabId = tid;
     }
   }
   if (!oldestTab) return null;
 
   await safePageClose(oldestTab.page);
   oldestGroup.delete(oldestTabId);
-  if (oldestGroup.size === 0) session.tabGroups.delete(oldestGroupKey);
+  dropEmptyTabGroup(session, oldestGroupKey, oldestGroup);
   const lock = tabLocks.get(oldestTabId);
   if (lock) { lock.drain(); tabLocks.delete(oldestTabId); }
   refreshTabLockQueueDepth();
@@ -1862,6 +2221,16 @@ function findTab(session, tabId) {
 // 410 Gone tells clients the tab existed but the browser crashed — create a new one.
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// How long after a browser launch we treat an unknown-but-plausible tab ID as
+// "lost in a restart" (→ 410 browser_restarted) instead of a plain 404.
+// Must exceed the longest expected gap between the client's last successful
+// call and its next call after a restart: the health probe probes at most 60s
+// apart, closeBrowserFully + relaunch can take a few minutes on slow disks,
+// and clients (agents) routinely pause for minutes between tool calls. 30
+// minutes covers all of that without leaving stale tabs masquerading as
+// "restarted" forever.
+const BROWSER_RESTARTED_WINDOW_MS = 30 * 60_000;
+
 function tabNotFoundResponse(res, tabId) {
   // Only return 410 for tabs that look like valid UUIDs (plausibly created by this server),
   // belonged to this machine, and were lost in a recent browser restart.
@@ -1870,13 +2239,46 @@ function tabNotFoundResponse(res, tabId) {
   const uuidPart = tabId && tabId.includes('_') && !tabId.slice(0, tabId.indexOf('_')).includes('-')
     ? tabId.slice(tabId.indexOf('_') + 1)
     : tabId;
-  if (_lastBrowserRestartAt && (Date.now() - _lastBrowserRestartAt < 300_000) && UUID_RE.test(uuidPart) && fly.isLocalTab(tabId)) {
+  if (_lastBrowserRestartAt && (Date.now() - _lastBrowserRestartAt < BROWSER_RESTARTED_WINDOW_MS) && UUID_RE.test(uuidPart) && fly.isLocalTab(tabId)) {
     return res.status(410).json({
       error: 'Tab no longer exists (browser was restarted). Create a new tab.',
       code: 'browser_restarted',
     });
   }
   return res.status(404).json({ error: 'Tab not found' });
+}
+
+// Deregister a tab whose page closed itself (e.g. an OAuth popup calling
+// window.close()). Without this, a self-closed popup stays in tabGroups and
+// GET /tabs keeps returning its tabId, and a later op on it raises the generic
+// "Target page, context or browser has been closed" error that handleRouteError
+// used to misread as a dead BrowserContext.
+//
+// We locate the tab by tabState identity rather than a captured tabId/userId so
+// a single chokepoint in createTabState covers every registration path (initial
+// create, proxy retry, dead-page replacement, google rotate, popups). The
+// `ts.page !== page` guard is the important part: the dead-page recovery path
+// swaps a live replacement page into the same tabId under a NEW tabState, so a
+// late close event from the old page must not wipe the replacement tab.
+function deregisterClosedTab(tabState, page) {
+  for (const [userId, session] of sessions) {
+    if (session._closing) continue;
+    for (const [listItemId, group] of session.tabGroups) {
+      for (const [tabId, entry] of group) {
+        if (entry !== tabState) continue;
+        if (entry.page !== page) return; // replaced by a live page under same id
+        group.delete(tabId);
+        dropEmptyTabGroup(session, listItemId, group);
+        const lock = tabLocks.get(tabId);
+        if (lock) { lock.drain(); tabLocks.delete(tabId); refreshTabLockQueueDepth(); }
+        refreshActiveTabsGauge();
+        tabsDestroyedTotal.labels('page_self_closed').inc();
+        pluginEvents.emit('tab:destroyed', { userId, tabId, reason: 'page_self_closed' });
+        log('info', 'tab deregistered on page self-close', { userId, tabId });
+        return;
+      }
+    }
+  }
 }
 
 function createTabState(page) {
@@ -1893,15 +2295,59 @@ function createTabState(page) {
     failureJournal: [],
     healthTracker,
     lastSnapshot: null,
+    lastStructure: null,
     lastRequestedUrl: null,
+    lastNavigationHttpStatus: null,
     googleRetryCount: 0,
     navigateAbort: null,
     pressureObservedAt: Date.now(),
     pressureObservedToolCalls: 0,
     crashed: false,
+    lastMainFrameResponse: null,
   };
   page?.on?.('crash', () => { tabState.crashed = true; });
+  // A page that closes itself (popup window.close(), site-initiated close)
+  // deregisters its own tab so GET /tabs stops advertising a dead tabId.
+  page?.on?.('close', () => { deregisterClosedTab(tabState, page); });
+  attachNavigationResponseTracker(tabState);
   return tabState;
+}
+
+/**
+ * Best-effort: measure a popup's current size and, if it came up implausibly
+ * small in headed mode, nudge it to a usable size so Google popup OAuth works.
+ *
+ * Stealth note: main browser contexts stay viewport:null (an anti-detection
+ * choice -- a fixed round viewport is a fingerprint tell). This only touches
+ * popups that are both headed AND measurably too small; usable-size popups are
+ * left on their natural size. Fully wrapped so any failure is swallowed and
+ * never disrupts popup registration or the parent flow.
+ */
+async function maybeResizeSmallPopup(popupPage) {
+  try {
+    // With viewport:null, viewportSize() may return the real window size or
+    // null. Fall back to the in-page innerWidth/innerHeight when it's null.
+    let size = null;
+    try { size = popupPage.viewportSize(); } catch { size = null; }
+    if (!size || !Number.isFinite(size.width) || !Number.isFinite(size.height)) {
+      try {
+        size = await popupPage.evaluate(() => ({ width: window.innerWidth, height: window.innerHeight }));
+      } catch { size = null; }
+    }
+    const width = size && Number.isFinite(size.width) ? size.width : NaN;
+    const height = size && Number.isFinite(size.height) ? size.height : NaN;
+    if (!shouldResizePopup({ headed: browserLaunchedHeaded, shimInstalled: viewportShimInstalled, width, height })) {
+      return;
+    }
+    log('info', 'nudging implausibly-small popup to usable size', {
+      fromWidth: width, fromHeight: height,
+      toWidth: POPUP_RESIZE_TARGET.width, toHeight: POPUP_RESIZE_TARGET.height,
+    });
+    await popupPage.setViewportSize({ width: POPUP_RESIZE_TARGET.width, height: POPUP_RESIZE_TARGET.height });
+  } catch (err) {
+    // Never let a resize failure break popup tracking.
+    log('debug', 'popup resize skipped (best-effort)', { error: err?.message });
+  }
 }
 
 /**
@@ -1926,6 +2372,10 @@ function attachPopupHandler(page, userId, sessionKey) {
     refreshActiveTabsGauge();
     log('info', 'popup registered as managed tab', { userId: key, tabId: popupTabId, url: safePageUrl(popupPage) });
     pluginEvents.emit('tab:created', { userId: key, tabId: popupTabId, page: popupPage, url: safePageUrl(popupPage) });
+    // Best-effort, post-registration: nudge an implausibly-small headed popup to
+    // a usable size so Google ux_mode=popup OAuth is operable. Fire-and-forget so
+    // it never delays tab readiness; failures are swallowed inside the helper.
+    maybeResizeSmallPopup(popupPage);
     // Recursively handle popups from the popup
     attachPopupHandler(popupPage, userId, sessionKey);
   });
@@ -2085,6 +2535,20 @@ async function isGoogleUnavailable(page) {
   return /Unable to connect|502 Bad Gateway or Proxy Error|Camoufox can't establish a connection/.test(bodyText);
 }
 
+async function isFallbackSearchBlocked(page, engine) {
+  if (!page || page.isClosed()) return true;
+  const url = page.url();
+  const bodyText = await page.evaluate(() => document.body?.innerText?.slice(0, 1000) || '').catch(() => '');
+  if (/Unable to connect|502 Bad Gateway or Proxy Error|Camoufox can't establish a connection/i.test(bodyText)) return true;
+  if (engine === 'duckduckgo') {
+    return !/duckduckgo\.com/i.test(url) || /captcha|verify you are human|unusual traffic/i.test(bodyText);
+  }
+  if (engine === 'bing') {
+    return !/bing\.com/i.test(url) || /captcha|verify you are human|unusual traffic/i.test(bodyText);
+  }
+  return true;
+}
+
 async function rotateGoogleTab(userId, sessionKey, tabId, previousTabState, reason, reqId) {
   if (!previousTabState?.lastRequestedUrl || !isGoogleSearchUrl(previousTabState.lastRequestedUrl)) return null;
   if ((previousTabState.googleRetryCount || 0) >= 3) return null;
@@ -2118,10 +2582,10 @@ async function rotateGoogleTab(userId, sessionKey, tabId, previousTabState, reas
     proxySession: session.proxySessionId || null,
   });
 
-  await withPageLoadDuration('navigate', () => navigatePage(page, 'https://www.google.com/'));
+  await withPageLoadDuration('navigate', () => navigatePage(page, 'https://www.google.com/', { timeout: NAVIGATE_TIMEOUT_MS }));
   tabState.visitedUrls.add('https://www.google.com/');
   await page.waitForTimeout(1200);
-  await withPageLoadDuration('navigate', () => navigatePage(page, tabState.lastRequestedUrl));
+  await withPageLoadDuration('navigate', () => navigatePage(page, tabState.lastRequestedUrl, { timeout: NAVIGATE_TIMEOUT_MS }));
   tabState.visitedUrls.add(tabState.lastRequestedUrl);
   return { session, tabState };
 }
@@ -2324,53 +2788,43 @@ async function extractGoogleSerp(page) {
     
     const resultContainer = document.querySelector('#rso') || document.querySelector('#search');
     if (resultContainer) {
-      const resultBlocks = resultContainer.querySelectorAll(':scope > div');
-      for (const block of resultBlocks) {
-        const h3 = block.querySelector('h3');
-        const mainLink = h3 ? h3.closest('a') : null;
-        
-        if (h3 && mainLink) {
-          const title = h3.textContent.trim().replace(/"/g, '\\"');
-          const href = mainLink.href;
-          const cite = block.querySelector('cite');
-          const displayUrl = cite ? cite.textContent.trim() : '';
-          
-          let snippet = '';
-          for (const sel of ['[data-sncf]', '[data-content-feature="1"]', '.VwiC3b', 'div[style*="-webkit-line-clamp"]', 'span.aCOpRe']) {
-            const el = block.querySelector(sel);
-            if (el) { snippet = el.textContent.trim().slice(0, 300); break; }
-          }
-          if (!snippet) {
-            const allText = block.textContent.trim().replace(/\s+/g, ' ');
-            const titleLen = title.length + (displayUrl ? displayUrl.length : 0);
-            if (allText.length > titleLen + 20) {
-              snippet = allText.slice(titleLen).trim().slice(0, 300);
-            }
-          }
-          
-          const refId = addRef('link', title);
-          snapshot.push('- link "' + title + '" [' + refId + ']:');
-          snapshot.push('  - /url: ' + href);
-          if (displayUrl) snapshot.push('  - cite: ' + displayUrl);
-          if (snippet) snapshot.push('  - text: ' + snippet);
-        } else {
-          const blockLinks = block.querySelectorAll('a[href^="http"]:not([href*="google.com/search"])');
-          if (blockLinks.length > 0) {
-            const blockText = block.textContent.trim().replace(/\s+/g, ' ').slice(0, 200);
-            if (blockText.length > 10) {
-              snapshot.push('- group:');
-              snapshot.push('  - text: ' + blockText);
-              blockLinks.forEach(a => {
-                const linkText = (a.textContent || '').trim().replace(/"/g, '\\"').slice(0, 100);
-                if (linkText.length > 2) {
-                  const refId = addRef('link', linkText);
-                  snapshot.push('  - link "' + linkText + '" [' + refId + ']:');
-                  snapshot.push('    - /url: ' + a.href);
-                }
-              });
-            }
-          }
+      const seenResultUrls = new Set();
+      const resultHeadings = resultContainer.querySelectorAll('h3');
+      for (const h3 of resultHeadings) {
+        const mainLink = h3.closest('a[href]');
+        if (!mainLink || !mainLink.href || seenResultUrls.has(mainLink.href)) continue;
+        if (mainLink.href.includes('google.com/search')) continue;
+        seenResultUrls.add(mainLink.href);
+
+        // Google's organic cards are nested several wrappers below #rso. Walk up
+        // to the nearest result-sized container instead of assuming direct children.
+        const block = h3.closest('.MjjYud, .g, [data-snhf], [data-content-feature]')
+          || mainLink.parentElement?.parentElement
+          || mainLink.parentElement
+          || resultContainer;
+        const title = h3.textContent.trim().replace(/"/g, '\\"');
+        if (!title) continue;
+        const href = mainLink.href;
+        const cite = block.querySelector('cite');
+        const displayUrl = cite ? cite.textContent.trim() : '';
+
+        let snippet = '';
+        for (const sel of ['[data-sncf]', '[data-content-feature="1"]', '.VwiC3b', 'div[style*="-webkit-line-clamp"]', 'span.aCOpRe']) {
+          const el = block.querySelector(sel);
+          if (el && !h3.contains(el)) { snippet = el.textContent.trim().slice(0, 300); break; }
         }
+        if (!snippet) {
+          const allText = block.textContent.trim().replace(/\s+/g, ' ');
+          const titleOffset = allText.indexOf(h3.textContent.trim());
+          const afterTitle = titleOffset >= 0 ? allText.slice(titleOffset + h3.textContent.trim().length) : allText;
+          if (afterTitle.length > 20) snippet = afterTitle.trim().slice(0, 300);
+        }
+
+        const refId = addRef('link', title);
+        snapshot.push('- link "' + title + '" [' + refId + ']:');
+        snapshot.push('  - /url: ' + href);
+        if (displayUrl) snapshot.push('  - cite: ' + displayUrl);
+        if (snippet) snapshot.push('  - text: ' + snippet);
       }
     }
     
@@ -2500,8 +2954,6 @@ async function _buildRefsInner(page, refs, start) {
       const [, role, name] = match;
       const normalizedRole = role.toLowerCase();
       
-      if (normalizedRole === 'combobox') continue;
-      
       if (name && SKIP_PATTERNS.some(p => p.test(name))) continue;
       
       if (INTERACTIVE_ROLES.includes(normalizedRole)) {
@@ -2560,7 +3012,6 @@ async function _buildRefsInner(page, refs, start) {
           if (match) {
             const [, role, name] = match;
             const normalizedRole = role.toLowerCase();
-            if (normalizedRole === 'combobox') continue;
             if (name && SKIP_PATTERNS.some(p => p.test(name))) continue;
             
             if (INTERACTIVE_ROLES.includes(normalizedRole)) {
@@ -2658,6 +3109,39 @@ async function getAriaSnapshot(page) {
   return mainYaml;
 }
 
+// Precondition check for click-by-ref: rebuild refs, then confirm the target
+// still matches the caller's expected role / accessible name before clicking.
+// Returns null when the target still matches (proceed), or a structured
+// mismatch result (with a fresh annotated snapshot) when it no longer does.
+async function semanticTargetMismatchResult(tabState, ref, expectedRole, expectedAccessibleName) {
+  const ariaYaml = await getAriaSnapshot(tabState.page);
+  tabState.refs = await refreshTabRefs(tabState, { reason: 'semantic_precondition' });
+  const current = tabState.refs.get(ref);
+  const roleMatches = !expectedRole || current?.role === expectedRole;
+  const nameMatches = expectedAccessibleName === undefined
+    || normalizedAccessibleName(current?.name) === normalizedAccessibleName(expectedAccessibleName);
+  if (roleMatches && nameMatches) return null;
+
+  const snapshot = annotateAriaSnapshotRefs(ariaYaml, tabState.refs);
+  tabState.lastSnapshot = snapshot;
+  return {
+    ok: false,
+    code: 'semantic_target_mismatch',
+    retryable: true,
+    recovery: 'use_returned_snapshot',
+    error: 'The referenced element no longer matches the requested role or accessible name. No click was performed; use the returned snapshot and a current ref.',
+    ref,
+    expected: {
+      ...(expectedRole ? { role: expectedRole } : {}),
+      ...(expectedAccessibleName !== undefined ? { accessibleName: expectedAccessibleName } : {}),
+    },
+    actual: current ? { role: current.role, accessibleName: current.name } : null,
+    url: tabState.page.url(),
+    snapshot,
+    refsCount: tabState.refs.size,
+  };
+}
+
 function refToLocator(page, ref, refs) {
   const info = refs.get(ref);
   if (!info) return null;
@@ -2675,7 +3159,7 @@ function refToLocator(page, ref, refs) {
       frame = page.frames().find(f => f.url() === frameUrl || f.url().startsWith(frameUrl.slice(0, 80)));
     }
     if (frame) {
-      let locator = frame.getByRole(role, name ? { name } : undefined);
+      let locator = frame.getByRole(role, { name, exact: true });
       locator = locator.nth(nth);
       return locator;
     }
@@ -2683,13 +3167,257 @@ function refToLocator(page, ref, refs) {
     log('warn', 'refToLocator: frame not found for iframe ref', { ref, frameName, frameUrl: frameUrl?.slice(0, 60) });
   }
   
-  let locator = page.getByRole(role, name ? { name } : undefined);
+  let locator = page.getByRole(role, { name, exact: true });
   
   // Always use .nth() to disambiguate duplicate role+name combinations
   // This avoids "strict mode violation" when multiple elements match
   locator = locator.nth(nth);
   
   return locator;
+}
+
+/**
+ * Resolve each ref to its bounding box on the page.
+ * Returns an array of { refId, role, name, x, y, width, height } objects.
+ * Skips refs whose elements are not currently visible.
+ */
+async function getRefAnnotations(page, refs) {
+  const annotations = [];
+  if (!page || page.isClosed() || !refs || refs.size === 0) return annotations;
+
+  for (const [refId, info] of refs) {
+    try {
+      const locator = refToLocator(page, refId, refs);
+      if (!locator) continue;
+      // Explicit short timeout per ref: a bare boundingBox() inherits
+      // Playwright's 30s default, which across many refs could blow the
+      // request budget. Detached/invisible elements are skipped fast.
+      const box = await locator.boundingBox({ timeout: 1000 });
+      if (box && box.width > 0 && box.height > 0) {
+        annotations.push({
+          refId,
+          role: info.role,
+          name: info.name,
+          x: Math.round(box.x),
+          y: Math.round(box.y),
+          width: Math.round(box.width),
+          height: Math.round(box.height),
+        });
+      }
+    } catch {
+      // Element may have disappeared — skip silently
+    }
+  }
+  return annotations;
+}
+
+function actionableName(value) {
+  return String(value || '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+// Candidate discovery for the /actionables route. Returns visible link/button/
+// combobox elements paired with their current refs. This is discovery
+// metadata only -- the selected ref is re-resolved in the interaction route,
+// so this single document pass cannot authorize a stale click.
+async function actionablesForRefs(page, refs, { limit = 200 } = {}) {
+  const actionableRoles = new Set(['link', 'button', 'combobox']);
+  const refsByRoleAndName = new Map();
+  for (const [ref, info] of refs) {
+    if (info.frameName || info.frameUrl || !actionableRoles.has(info.role)) continue;
+    const key = `${info.role}:${actionableName(info.name)}`;
+    const matches = refsByRoleAndName.get(key) || [];
+    matches.push({ ref, label: info.name });
+    refsByRoleAndName.set(key, matches);
+  }
+
+  const elements = await page.locator('a, button, [role="link"], [role="button"], [role="combobox"]').evaluateAll((nodes) => nodes.map((element) => {
+    const tag = element.tagName.toLowerCase();
+    const explicitRole = element.getAttribute('role')?.toLowerCase();
+    const role = explicitRole === 'link' || explicitRole === 'button' || explicitRole === 'combobox'
+      ? explicitRole
+      : tag === 'a' ? 'link' : tag === 'button' ? 'button' : '';
+    if (!role) return null;
+
+    const rect = element.getBoundingClientRect();
+    const style = window.getComputedStyle(element);
+    const visible = rect.width > 0 && rect.height > 0
+      && rect.bottom > 0 && rect.right > 0
+      && rect.top < window.innerHeight && rect.left < window.innerWidth
+      && style.visibility !== 'hidden' && style.display !== 'none';
+    if (!visible) return null;
+
+    const labelledBy = (element.getAttribute('aria-labelledby') || '').split(/\s+/)
+      .map((id) => document.getElementById(id)?.textContent || '')
+      .join(' ');
+    const label = element.getAttribute('aria-label')
+      || labelledBy
+      || element.innerText
+      || element.getAttribute('title')
+      || element.querySelector('img[alt]')?.getAttribute('alt')
+      || element.textContent
+      || '';
+    const anchor = element instanceof HTMLAnchorElement ? element : null;
+    return {
+      role,
+      label: label.replace(/\s+/g, ' ').trim(),
+      tag,
+      href: anchor?.href || '',
+      disabled: element.matches(':disabled,[aria-disabled="true"]'),
+      inForm: Boolean(element.closest('form')),
+      download: Boolean(anchor?.hasAttribute('download')),
+    };
+  })).catch(() => []);
+
+  const actionables = [];
+  const matchedRefs = new Set();
+  for (const element of elements) {
+    if (!element || actionables.length >= limit) continue;
+    const matches = refsByRoleAndName.get(`${element.role}:${actionableName(element.label)}`);
+    if (!matches?.length) continue;
+    // Consume in document order so repeated accessible names retain the
+    // role/name/nth mapping used during live revalidation.
+    const { ref, label } = matches.shift();
+    matchedRefs.add(ref);
+    actionables.push({ ref, label, role: element.role, tag: element.tag, href: element.href, disabled: element.disabled, inForm: element.inForm, download: element.download, visible: true });
+  }
+
+  // Some dynamic pages expose an AX link name that differs from its DOM text
+  // (Google result cards are one example). Preserve the fast one-pass matching
+  // above, but when it produced too few candidates, resolve only unmatched AX
+  // refs individually. The same fallback runs again immediately before an
+  // interaction, so this remains discovery metadata rather than authorization.
+  if (actionables.length < 8) {
+    for (const [ref, info] of refs) {
+      if (actionables.length >= limit || matchedRefs.has(ref) || info.frameName || info.frameUrl || !actionableRoles.has(info.role)) continue;
+      try {
+        const metadata = await refToLocator(page, ref, refs).evaluate((element) => {
+          const tag = element.tagName.toLowerCase();
+          const rect = element.getBoundingClientRect();
+          const style = window.getComputedStyle(element);
+          if (!(rect.width > 0 && rect.height > 0 && rect.bottom > 0 && rect.right > 0 && rect.top < window.innerHeight && rect.left < window.innerWidth) || style.visibility === 'hidden' || style.display === 'none') return null;
+          const anchor = element instanceof HTMLAnchorElement ? element : null;
+          return { tag, href: anchor?.href || '', disabled: element.matches(':disabled,[aria-disabled="true"]'), inForm: Boolean(element.closest('form')), download: Boolean(anchor?.hasAttribute('download')) };
+        }, undefined, { timeout: 1_000 });
+        if (!metadata) continue;
+        matchedRefs.add(ref);
+        actionables.push({ ref, label: info.name, role: info.role, ...metadata, visible: true });
+      } catch {
+        // This specific ref disappeared or changed while the fallback ran.
+      }
+    }
+  }
+  return actionables;
+}
+
+// Text-input discovery for the /actionables route. Emits a stable per-element
+// targetId (hash of a document-scoped opaque identity token) so a caller can
+// tell whether an input field is the same element across snapshots, plus
+// bounded visibility/sensitivity metadata. Main-document only.
+async function inputsForRefs(page, refs, { limit = 100 } = {}) {
+  const inputs = [];
+  for (const [ref, info] of refs) {
+    if (inputs.length >= limit) break;
+    // Input metadata only covers the main document. Frame-local metadata must not leave the browser process.
+    if (info.frameName || info.frameUrl || !['textbox', 'searchbox', 'combobox'].includes(info.role)) continue;
+    const locator = refToLocator(page, ref, refs);
+    try {
+      const input = await locator.evaluate((element) => {
+        const tag = element.tagName.toLowerCase();
+        const nativeInput = element instanceof HTMLInputElement;
+        const textarea = element instanceof HTMLTextAreaElement;
+        const contentEditable = element.isContentEditable;
+        const inputType = nativeInput ? element.type.toLowerCase()
+          : textarea ? 'textarea'
+            : contentEditable ? 'contenteditable'
+              : null;
+        if (!((nativeInput && ['text', 'search'].includes(inputType)) || textarea || contentEditable)) return null;
+
+        const rect = element.getBoundingClientRect();
+        const style = window.getComputedStyle(element);
+        const visible = rect.width > 0 && rect.height > 0
+          && rect.bottom > 0 && rect.right > 0
+          && rect.top < window.innerHeight && rect.left < window.innerWidth
+          && style.visibility !== 'hidden' && style.display !== 'none';
+        const enabled = !element.matches(':disabled,[aria-disabled="true"]');
+        const readOnly = Boolean(element.readOnly || element.getAttribute('aria-readonly') === 'true');
+        const form = element.closest('form');
+        const sensitiveSignals = { credentials: false, payment: false, oneTimeCode: false };
+        if (form) {
+          for (const control of form.elements) {
+            const type = (control.type || '').toLowerCase();
+            const autocomplete = (control.autocomplete || '').toLowerCase();
+            const hint = `${control.name || ''} ${control.id || ''} ${control.getAttribute('aria-label') || ''}`.toLowerCase();
+            sensitiveSignals.credentials ||= type === 'password' || /(?:^|\s)(?:username|current-password|new-password)(?:\s|$)/.test(autocomplete) || /password|passcode|username|login/.test(hint);
+            sensitiveSignals.payment ||= /(?:^|\s)(?:cc-|transaction-amount)(?:\s|$)/.test(autocomplete) || /card|credit|debit|cvv|cvc|iban/.test(hint);
+            sensitiveSignals.oneTimeCode ||= /(?:^|\s)one-time-code(?:\s|$)/.test(autocomplete) || /\b(?:otp|one.?time|verification.?code)\b/.test(hint);
+          }
+        }
+        // Keep a document-scoped opaque token for this exact Element object.
+        // Accessibility names and DOM layout routinely change while a public
+        // control remains the same element, so neither is an identity source.
+        // A replacement node gets a new WeakMap entry; navigation creates a
+        // new Document and therefore a new registry.
+        const registryKey = Symbol.for('camofox-browser.input-identity-v1');
+        let registry = document[registryKey];
+        if (!registry || !(registry.elements instanceof WeakMap) || !(registry.inputListeners instanceof WeakSet)) {
+          const nonce = Array.from(crypto.getRandomValues(new Uint32Array(4)), (part) => part.toString(36)).join('-');
+          registry = {
+            nonce,
+            next: 0,
+            elements: new WeakMap(),
+            inputListeners: new WeakSet(),
+            pendingInputToken: null,
+          };
+          Object.defineProperty(document, registryKey, { value: registry });
+        }
+        let identityToken = registry.elements.get(element);
+        // Some SPA frameworks replace a focused editable element immediately
+        // after its input event. Preserve its opaque control lineage only for
+        // the newly focused replacement produced by that input event. This is
+        // browser state, not a label-, selector-, or site-specific rule.
+        if (!identityToken && registry.pendingInputToken && document.activeElement === element) {
+          identityToken = registry.pendingInputToken;
+          registry.pendingInputToken = null;
+          registry.elements.set(element, identityToken);
+        }
+        if (!identityToken) {
+          identityToken = `${registry.nonce}:${++registry.next}`;
+          registry.elements.set(element, identityToken);
+        } else if (registry.pendingInputToken === identityToken) {
+          registry.pendingInputToken = null;
+        }
+        if (!registry.inputListeners.has(element)) {
+          registry.inputListeners.add(element);
+          element.addEventListener('input', () => {
+            registry.pendingInputToken = registry.elements.get(element) || null;
+          }, { once: true });
+        }
+        return {
+          tag,
+          identityToken,
+          inputType,
+          autocomplete: element.getAttribute('autocomplete') || null,
+          state: { visible, enabled, readOnly, editable: visible && enabled && !readOnly },
+          form: {
+            present: Boolean(form),
+            method: form ? form.method.toLowerCase() : null,
+            target: form ? ((!form.target || form.target.toLowerCase() === '_self') ? 'self' : 'other') : null,
+            sensitiveSignals,
+          },
+        };
+      }, undefined, { timeout: 1_000 });
+      if (input?.state.visible) {
+        const { identityToken, ...metadata } = input;
+        const targetId = crypto.createHash('sha256')
+          .update(identityToken)
+          .digest('base64url');
+        inputs.push({ ref, targetId, label: info.name, role: info.role, ...metadata });
+      }
+    } catch {
+      // The page can change between the AX snapshot and this bounded inspection.
+    }
+  }
+  return inputs;
 }
 
 async function refreshTabRefs(tabState, options = {}) {
@@ -2805,7 +3533,7 @@ app.get('/health', (req, res) => {
     activeSessions: sessions.size,
     consecutiveFailures: Array.from(userNavHealth.values())
       .reduce((sum, h) => sum + h.consecutiveNavFailures, 0),
-    memory: { rssMb, heapUsedMb, nativeMemMb },
+    memory: { rssMb, heapUsedMb, nativeMemMb, cgroup: cgroupMemory() },
     vncPort: parseInt(process.env.NOVNC_PORT, 10) || 6080,
     ...(FLY_MACHINE_ID ? { machineId: FLY_MACHINE_ID } : {}),
   });
@@ -2974,6 +3702,13 @@ app.post('/pressure/cleanup', async (req, res) => {
  *                   type: string
  *                 url:
  *                   type: string
+ *                 httpStatus:
+ *                   type: integer
+ *                   nullable: true
+ *                   description: HTTP status of the optional initial document navigation.
+ *                 navigationOk:
+ *                   type: boolean
+ *                   description: False when the optional initial document navigation returned HTTP 400 or higher.
  *       400:
  *         description: Missing required fields.
  *         content:
@@ -2992,8 +3727,34 @@ app.post('/pressure/cleanup', async (req, res) => {
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       503:
+ *         description: >-
+ *           The browser is still cold-starting (coalesced context build warming up)
+ *           and the route deadline fired before it finished. Retriable — honor the
+ *           Retry-After header. Also returned for memory-cap and Fly admission bounces.
+ *         headers:
+ *           Retry-After:
+ *             schema:
+ *               type: integer
+ *             description: Seconds to wait before retrying (present for the warming-up case).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
 app.post('/tabs', async (req, res) => {
+  // The tab is registered before it navigates, and the route deadline can pass
+  // while navigation is still in flight. An error response carries no tabId, so
+  // the catch below attempts to discard any registered tab, and a registration
+  // completed after abandonment attempts its own cleanup.
+  let createdTabId = null;
+  let abandoned = false;
+  const discardCreatedTab = async () => {
+    if (!createdTabId) return;
+    const session = sessions.get(normalizeUserId(req.body.userId));
+    if (session) await destroyTimedOutTab(session, createdTabId, 'tab_create_failed', req.body.userId);
+    createdTabId = null;
+  };
   try {
     const { userId, sessionKey, listItemId, url, trace } = req.body;
     // Accept both sessionKey (preferred) and listItemId (legacy) for backward compatibility
@@ -3018,7 +3779,14 @@ app.post('/tabs', async (req, res) => {
       }
     }
 
-    const result = await withTimeout((async () => {
+    // At the cap the new page times out and recovery destroys every tab of this userId; refuse first.
+    const mem = cgroupMemory();
+    if (mem?.atCap) return memoryCapResponse(res, mem);
+
+    // Keep a handle on the build work so the deadline can be extended once (see
+    // below) without starting a second, racing build.
+    const tabCreateKey = normalizeUserId(userId);
+    const tabCreateWork = (async () => {
       const existing = sessions.get(normalizeUserId(userId));
       if (trace && existing && !existing.tracePath) {
         throw Object.assign(
@@ -3033,7 +3801,7 @@ app.post('/tabs', async (req, res) => {
       
       // Recycle oldest tab when limits are reached instead of rejecting
       if (totalTabs >= MAX_TABS_PER_SESSION || getTotalTabCount() >= MAX_TABS_GLOBAL) {
-        const recycled = await recycleOldestTab(session, req.reqId, userId);
+        const recycled = await recycleOldestTab(session, req.reqId, userId, resolvedSessionKey);
         if (!recycled) {
           throw Object.assign(new Error('Maximum tabs per session reached'), { statusCode: 429 });
         }
@@ -3041,7 +3809,7 @@ app.post('/tabs', async (req, res) => {
       
       const createdPage = await createPageWithRecoveryForUser(userId, session, { trace: !!trace });
       session = createdPage.session;
-      const page = createdPage.page;
+      let page = createdPage.page;
       const lease = createdPage.lease;
       const group = getTabGroup(session, resolvedSessionKey);
 
@@ -3049,18 +3817,27 @@ app.post('/tabs', async (req, res) => {
       let tabState = createTabState(page);
       attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
       group.set(tabId, tabState);
+      createdTabId = tabId;
       releasePageLease(session, lease);
       attachPopupHandler(page, userId, resolvedSessionKey);
       refreshActiveTabsGauge();
-      
+      if (abandoned) {
+        // The route deadline passed during session or page creation.
+        await discardCreatedTab();
+        throw new Error('tab create abandoned after the route deadline');
+      }
+
       if (url) {
         const urlErr = validateUrl(url);
         if (urlErr) throw Object.assign(new Error(urlErr), { statusCode: 400 });
         tabState.lastRequestedUrl = url;
         try {
-          await withPageLoadDuration('open_url', () => navigatePage(page, url));
+          const navigationResponse = await withPageLoadDuration('open_url', () => navigatePage(page, url));
+          tabState.lastNavigationHttpStatus = typeof navigationResponse?.status === 'function' ? navigationResponse.status() : null;
           recordNavSuccess(userId);
         } catch (navErr) {
+          // A page closed by discardCreatedTab is not a navigation verdict.
+          if (abandoned) throw navErr;
           if ((isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions) {
             log('warn', 'tab create navigate failed, retrying with fresh proxy', {
               reqId: req.reqId, tabId, error: navErr.message,
@@ -3075,13 +3852,20 @@ app.post('/tabs', async (req, res) => {
             const retryGroup = getTabGroup(session, resolvedSessionKey);
             const { page: retryPage, lease: retryLease } = await createLeasedPage(session);
             tabState = createTabState(retryPage);
+            page = retryPage;
             tabState.lastRequestedUrl = url;
             attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
             retryGroup.set(tabId, tabState);
+            createdTabId = tabId;
             releasePageLease(session, retryLease);
             attachPopupHandler(retryPage, userId, resolvedSessionKey);
             refreshActiveTabsGauge();
-            await withPageLoadDuration('open_url', () => navigatePage(retryPage, url));
+            if (abandoned) {
+              await discardCreatedTab();
+              throw new Error('tab create abandoned after the route deadline');
+            }
+            const navigationResponse = await withPageLoadDuration('open_url', () => navigatePage(retryPage, url));
+            tabState.lastNavigationHttpStatus = typeof navigationResponse?.status === 'function' ? navigationResponse.status() : null;
             recordNavSuccess(userId);
           } else {
             if (recordNavFailure(userId)) {
@@ -3092,15 +3876,83 @@ app.post('/tabs', async (req, res) => {
         }
         tabState.visitedUrls.add(url);
       }
-      
+      // The route deadline passed during navigation and the catch below has
+      // begun discarding the tab, so do not announce it.
+      if (abandoned) throw new Error('tab create abandoned after the route deadline');
+
       pluginEvents.emit('tab:created', { userId, tabId, page, url: page.url() });
       log('info', 'tab created', { reqId: req.reqId, tabId, userId, sessionKey: resolvedSessionKey, url: page.url() });
-      return { tabId, url: page.url() };
-    })(), requestTimeoutMs(), 'tab create');
+      return {
+        tabId,
+        url: page.url(),
+        httpStatus: tabState.lastNavigationHttpStatus,
+        navigationOk: tabState.lastNavigationHttpStatus === null || tabState.lastNavigationHttpStatus < 400,
+      };
+    })();
+
+    let result;
+    try {
+      result = await withTimeout(tabCreateWork, tabCreateRequestTimeoutMs(), 'tab create');
+    } catch (deadlineErr) {
+      // PART B — bounded one-time deadline extension.
+      // The base deadline fired. If a cold CONTEXT BUILD is genuinely still in
+      // flight for this user (its entry is present in the sessionCreations
+      // coalescing map), the slow part is a heavy storage-state restore that is
+      // about to finish, not a stuck navigation. Give the SAME build one extra
+      // bounded budget to land instead of forcing a blind client retry.
+      //
+      // Race-safety: sessionCreations is a plain Map mutated only inside
+      // getSession()/coalesceInflight() on this single-threaded event loop. The
+      // entry is set synchronously before the build's first await and deleted in
+      // the factory's finally. Reading .has() here is an atomic snapshot between
+      // awaits — no interleaving can tear it. We extend by awaiting the existing
+      // tabCreateWork promise (never a new build), so coalescing is untouched and
+      // we cannot double-build. We extend at most ONCE; if no build is in flight
+      // (a genuinely stuck navigation), or the extended deadline is also
+      // exceeded, the error propagates to the catch below and Part A turns the
+      // tab-create deadline timeout into a retriable 503.
+      if (isTabCreateDeadlineTimeout(deadlineErr) && sessionCreations.has(tabCreateKey)) {
+        log('info', 'tab create deadline extended: cold build in flight', {
+          reqId: req.reqId, userId: tabCreateKey, extensionMs: TAB_CREATE_BUILD_EXTENSION_MS,
+        });
+        result = await withTimeout(tabCreateWork, TAB_CREATE_BUILD_EXTENSION_MS, 'tab create');
+      } else {
+        throw deadlineErr;
+      }
+    }
 
     res.json(result);
   } catch (err) {
     log('error', 'tab create failed', { reqId: req.reqId, error: err.message });
+    abandoned = true;
+    try {
+      await discardCreatedTab();
+    } catch (cleanupErr) {
+      log('warn', 'tab create cleanup failed', { reqId: req.reqId, tabId: createdTabId, error: cleanupErr?.message ?? String(cleanupErr) });
+    }
+    // A responsive new-page timeout (#14668) must stay on this machine with its
+    // live session and win over the near-cap bounce (#14624): do not remap it to
+    // memory_cap_reached.
+    const mem = isTimeoutError(err) && err.code !== 'new_page_timeout' ? cgroupMemory() : null;
+    if (mem?.nearCap) return memoryCapResponse(res, mem);
+    // PART A — the tab-create route deadline fired on a cold start that is still
+    // warming up (and, per Part B, already got its one extension). The build is
+    // coalesced and typically completes microseconds later, so a generic 500
+    // would be a lie: the work is succeeding. Return a retriable 503 that clients
+    // can detect by field, not prose. This sits AFTER the near-cap bounce so the
+    // memory-cap path still wins, and only matches the outer 'tab create'
+    // deadline timeout (never err.code === 'new_page_timeout'); the Fly 503
+    // fly-replay path below is keyed on err.statusCode === 503, which this
+    // timeout error does not carry, so that precedence is preserved too.
+    if (isTabCreateDeadlineTimeout(err)) {
+      res.set('Retry-After', '5');
+      return res.status(503).json({
+        error: 'Browser is warming up, retry shortly',
+        code: 'tab_create_warming',
+        retryable: true,
+        recovery: 'retry',
+      });
+    }
     // SSL certificate errors on initial navigation — non-retriable
     const isSslError = err.message && (
       err.message.includes('SEC_ERROR') ||
@@ -3114,8 +3966,9 @@ app.post('/tabs', async (req, res) => {
         recoverable: false,
       });
     }
-    // Memory pressure / max sessions → bounce through LB to another machine
-    if (FLY_MACHINE_ID && err.statusCode === 503) {
+    // Memory pressure / max sessions → bounce through LB to another machine.
+    // A responsive new-page timeout must stay on this machine with its live session.
+    if (FLY_MACHINE_ID && err.statusCode === 503 && err.code !== 'new_page_timeout') {
       res.set('fly-replay', `app=${CONFIG.flyAppName || 'camofox-browser'}`);
       return res.status(503).json({ error: safeError(err), code: err.code || 'admission_rejected' });
     }
@@ -3161,11 +4014,25 @@ app.post('/tabs', async (req, res) => {
  *                 type: string
  *     responses:
  *       200:
- *         description: Navigation result with snapshot.
+ *         description: Navigation result. Destination HTTP status is reported even when a rendered error page is available.
  *         content:
  *           application/json:
  *             schema:
  *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 tabId:
+ *                   type: string
+ *                 url:
+ *                   type: string
+ *                 httpStatus:
+ *                   type: integer
+ *                   nullable: true
+ *                   description: HTTP status of the final document navigation when available.
+ *                 navigationOk:
+ *                   type: boolean
+ *                   description: False when the final document returned an HTTP status of 400 or greater.
  *       400:
  *         description: Bad request.
  *         content:
@@ -3201,6 +4068,9 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
       if (macro && macro !== '__NO__' && macro !== 'none' && macro !== 'null') {
         targetUrl = expandMacro(macro, query) || url;
       }
+      const searchFallbacks = getSearchFallbacks(macro, query);
+      let searchFallback = null;
+      let navigationHttpStatus = null;
       
       if (!targetUrl) throw new Error('url or macro required');
       
@@ -3210,16 +4080,87 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
       return await withTabLock(tabId, async () => {
         const currentSessionKey = found?.listItemId || resolvedSessionKey;
         const isGoogleSearch = isGoogleSearchUrl(targetUrl);
+        const isAmazonSearch = macro === '@amazon_search';
+
+        const navigateAmazonSearch = async () => {
+          const amazonHomeUrl = 'https://www.amazon.com/';
+          tabState.lastRequestedUrl = targetUrl;
+          const homeResponse = await withPageLoadDuration('navigate', () => tabState.page.goto(amazonHomeUrl, { waitUntil: 'domcontentloaded', timeout: NAVIGATE_TIMEOUT_MS }));
+          if (homeResponse && homeResponse.status() >= 500) {
+            tabState.lastSnapshot = null;
+            throw Object.assign(
+              new Error(`Destination server returned HTTP ${homeResponse.status()}`),
+              { statusCode: 502, code: 'destination_unavailable', retryable: true },
+            );
+          }
+
+          const continueShopping = tabState.page.getByRole('button', { name: /continue shopping/i });
+          const searchInput = tabState.page.locator('input#twotabsearchtextbox:visible, input[name="field-keywords"]:visible, input[type="search"]:visible').first();
+          const amazonSurface = await Promise.race([
+            continueShopping.waitFor({ state: 'visible', timeout: NAVIGATE_TIMEOUT_MS }).then(() => 'continue'),
+            searchInput.waitFor({ state: 'visible', timeout: NAVIGATE_TIMEOUT_MS }).then(() => 'search'),
+          ]);
+          if (amazonSurface === 'continue') {
+            let continueNavigation;
+            try {
+              continueNavigation = tabState.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: NAVIGATE_TIMEOUT_MS });
+              await continueShopping.click({ noWaitAfter: true });
+              const continueResponse = await continueNavigation;
+              if (continueResponse && continueResponse.status() >= 500) {
+                tabState.lastSnapshot = null;
+                throw Object.assign(
+                  new Error(`Destination server returned HTTP ${continueResponse.status()}`),
+                  { statusCode: 502, code: 'destination_unavailable', retryable: true },
+                );
+              }
+            } catch (err) {
+              continueNavigation?.catch(() => {});
+              throw err;
+            }
+          }
+
+          await searchInput.waitFor({ state: 'visible', timeout: NAVIGATE_TIMEOUT_MS });
+          let searchNavigation;
+          try {
+            searchNavigation = tabState.page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: NAVIGATE_TIMEOUT_MS });
+            await searchInput.fill(query || '');
+            await searchInput.press('Enter');
+            const searchResponse = await searchNavigation;
+            if (searchResponse && searchResponse.status() >= 500) {
+              tabState.lastSnapshot = null;
+              throw Object.assign(
+                new Error(`Destination server returned HTTP ${searchResponse.status()}`),
+                { statusCode: 502, code: 'destination_unavailable', retryable: true },
+              );
+            }
+          } catch (err) {
+            searchNavigation?.catch(() => {});
+            throw err;
+          }
+          tabState.visitedUrls.add(amazonHomeUrl);
+          tabState.visitedUrls.add(targetUrl);
+          tabState.lastSnapshot = null;
+        };
 
         const navigateCurrentPage = async () => {
+          if (isAmazonSearch) return navigateAmazonSearch();
           tabState.lastRequestedUrl = targetUrl;
           const ac = tabState.navigateAbort = new AbortController();
-          const gotoP = withPageLoadDuration('navigate', () => navigatePage(tabState.page, targetUrl));
+          const gotoP = withPageLoadDuration('navigate', () => navigatePage(tabState.page, targetUrl, { timeout: NAVIGATE_TIMEOUT_MS }));
           try {
-            await Promise.race([
+            const response = await Promise.race([
               gotoP,
               new Promise((_, reject) => ac.signal.addEventListener('abort', () => reject(new Error('Navigation aborted: tab deleted')), { once: true })),
             ]);
+            tabState.lastNavigationHttpStatus = typeof response?.status === 'function' ? response.status() : null;
+            navigationHttpStatus = tabState.lastNavigationHttpStatus;
+            if (response && response.status() >= 500) {
+              tabState.lastSnapshot = null;
+              throw Object.assign(
+                new Error(`Destination server returned HTTP ${response.status()}`),
+                { statusCode: 502, code: 'destination_unavailable', retryable: true },
+              );
+            }
             tabState.visitedUrls.add(targetUrl);
             tabState.lastSnapshot = null;
           } catch (err) {
@@ -3230,17 +4171,93 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
           }
         };
 
+        // Pages can close independently while the BrowserContext remains usable.
+        // Keep the public tab ID stable by replacing only that page and retrying
+        // this navigation once. Destination errors are never recovered as success.
+        const replaceDeadTabPage = async () => {
+          const previousTabState = tabState;
+          const createdPage = await createPageWithRecoveryForUser(userId, session);
+          session = createdPage.session;
+          const group = getTabGroup(session, currentSessionKey);
+          const replacementPage = createdPage.page;
+          const replacementLease = createdPage.lease;
+          let replacementAttached = false;
+          try {
+            tabState = createTabState(replacementPage);
+            tabState.googleRetryCount = previousTabState.googleRetryCount || 0;
+            attachDownloadListener(tabState, tabId, log, pluginEvents, userId);
+            group.set(tabId, tabState);
+            attachPopupHandler(replacementPage, userId, currentSessionKey);
+            replacementAttached = true;
+          } finally {
+            releasePageLease(session, replacementLease);
+            if (!replacementAttached) await safePageClose(replacementPage);
+          }
+          await clearTabDownloads(previousTabState).catch(() => {});
+          await safePageClose(previousTabState.page);
+          refreshActiveTabsGauge();
+        };
+
+        const navigateWithDeadPageRecovery = async () => {
+          if (tabState.page?.isClosed?.()) await replaceDeadTabPage();
+          try {
+            await navigateCurrentPage();
+          } catch (err) {
+            if (!isDeadContextError(err)) throw err;
+            log('warn', 'navigate found a dead tab page; replacing it once', {
+              reqId: req.reqId,
+              tabId,
+            });
+            await replaceDeadTabPage();
+            await navigateCurrentPage();
+          }
+        };
+
         const prewarmGoogleHome = async () => {
           if (!isGoogleSearch || tabState.visitedUrls.has('https://www.google.com/')) return;
           const prewarm = await createLeasedPage(session);
           const prewarmPage = prewarm.page;
           try {
-            await withPageLoadDuration('navigate', () => navigatePage(prewarmPage, 'https://www.google.com/'));
+            await withPageLoadDuration('navigate', () => navigatePage(prewarmPage, 'https://www.google.com/', { timeout: NAVIGATE_TIMEOUT_MS }));
             tabState.visitedUrls.add('https://www.google.com/');
             await prewarmPage.waitForTimeout(1200);
           } finally {
             await closeLeasedPage(session, prewarmPage, prewarm.lease);
           }
+        };
+
+        const navigateSearchFallback = async () => {
+          for (const candidate of searchFallbacks) {
+            targetUrl = candidate.url;
+            try {
+              await navigateCurrentPage();
+              if (await isFallbackSearchBlocked(tabState.page, candidate.engine)) {
+                log('warn', 'search fallback blocked', {
+                  reqId: req.reqId,
+                  tabId,
+                  engine: candidate.engine,
+                  url: tabState.page.url(),
+                });
+                continue;
+              }
+              searchFallback = { searchEngine: candidate.engine, fallbackFrom: 'google' };
+              log('info', 'search fallback succeeded', {
+                reqId: req.reqId,
+                tabId,
+                engine: candidate.engine,
+                url: tabState.page.url(),
+              });
+              return true;
+            } catch (fallbackErr) {
+              log('warn', 'search fallback failed', {
+                reqId: req.reqId,
+                tabId,
+                engine: candidate.engine,
+                error: fallbackErr.message,
+              });
+            }
+          }
+          return false;
         };
 
         const recreateTabOnFreshContext = async () => {
@@ -3266,14 +4283,20 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
         };
 
         if (isGoogleSearch && proxyPool?.canRotateSessions) {
-          await prewarmGoogleHome();
+          await prewarmGoogleHome().catch((prewarmErr) => {
+            log('warn', 'google prewarm failed; continuing to search navigation', {
+              reqId: req.reqId,
+              tabId,
+              error: prewarmErr.message,
+            });
+          });
         }
 
         // Navigate with transparent retry on proxy/timeout errors.
         // If the proxy is blocked or the page times out, destroy the session,
         // get a fresh proxy, and retry once before failing to the caller.
         try {
-          await navigateCurrentPage();
+          await navigateWithDeadPageRecovery();
           recordNavSuccess(userId);
         } catch (navErr) {
           if ((isProxyError(navErr) || isTimeoutError(navErr)) && proxyPool?.canRotateSessions) {
@@ -3282,9 +4305,17 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
             });
             browserRestartsTotal.labels('proxy_retry').inc();
             await recreateTabOnFreshContext();
-            if (isGoogleSearch) await prewarmGoogleHome();
-            await navigateCurrentPage();
-            recordNavSuccess(userId);
+            if (isGoogleSearch) await prewarmGoogleHome().catch(() => {});
+            try {
+              await navigateWithDeadPageRecovery();
+              recordNavSuccess(userId);
+            } catch (retryErr) {
+              if (!isGoogleSearch || !await navigateSearchFallback()) throw retryErr;
+              recordNavSuccess(userId);
+            }
+          } else if (isGoogleSearch && navErr.code === 'destination_unavailable' && await navigateSearchFallback()) {
+            // The Google request failed upstream; a successful fallback is the
+            // existing search behavior and is the only success reported here.
           } else {
             if (recordNavFailure(userId)) {
               await recoverUserSession(userId, 'navigate_failure');
@@ -3301,26 +4332,66 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
             proxySession: browserLaunchProxy?.sessionId || null,
           });
           await recreateTabOnFreshContext();
-          await prewarmGoogleHome();
-          await navigateCurrentPage();
+          await prewarmGoogleHome().catch(() => {});
+          try {
+            await navigateWithDeadPageRecovery();
+          } catch (retryErr) {
+            if (!await navigateSearchFallback()) throw retryErr;
+          }
         }
         
-        // For Google SERP: skip eager ref building during navigate.
-        // Results render asynchronously after DOMContentLoaded -- the snapshot
-        // call will wait for and extract them.
+        // A Google HTTP 200 shell can have a search box but no organic cards after
+        // proxy rotation. Do not report it as a successful search: wait briefly for
+        // cards, then use the ordinary DuckDuckGo → Bing fallback.
         if (isGoogleSerp(tabState.page.url())) {
-          tabState.refs = new Map();
-          return { ok: true, tabId, url: tabState.page.url(), refsAvailable: false, googleSerp: true };
+          if (await hasGoogleOrganicResults(tabState.page)) {
+            tabState.refs = new Map();
+            return { ok: true, tabId, url: tabState.page.url(), refsAvailable: false, googleSerp: true };
+          }
+
+          log('warn', 'google search returned no organic results; using fallback', {
+            reqId: req.reqId,
+            tabId,
+            url: tabState.page.url(),
+          });
+          if (!await navigateSearchFallback()) {
+            return {
+              ok: false,
+              tabId,
+              url: tabState.page.url(),
+              refsAvailable: false,
+              googleResultsAvailable: false,
+              searchFallbackAttempted: searchFallbacks.length > 0,
+              searchFallbacksExhausted: searchFallbacks.length > 0,
+            };
+          }
         }
 
         if (isGoogleSearch && await isGoogleSearchBlocked(tabState.page)) {
-          return { ok: false, tabId, url: tabState.page.url(), refsAvailable: false, googleBlocked: true };
+          if (!await navigateSearchFallback()) {
+            return {
+              ok: false,
+              tabId,
+              url: tabState.page.url(),
+              refsAvailable: false,
+              googleBlocked: true,
+              searchFallbackAttempted: searchFallbacks.length > 0,
+            };
+          }
         }
         
         tabState.refs = await buildRefs(tabState.page);
-        return { ok: true, tabId, url: tabState.page.url(), refsAvailable: tabState.refs.size > 0 };
-      }, requestTimeoutMs());
-    })(), requestTimeoutMs(), 'navigate'));
+        return {
+          ok: true,
+          tabId,
+          url: tabState.page.url(),
+          refsAvailable: tabState.refs.size > 0,
+          httpStatus: navigationHttpStatus,
+          navigationOk: navigationHttpStatus === null || navigationHttpStatus < 400,
+          ...searchFallback,
+        };
+      }, navigationRequestTimeoutMs());
+    })(), navigationRequestTimeoutMs(), 'navigate'));
     
     log('info', 'navigated', { reqId: req.reqId, tabId, url: result.url });
     pluginEvents.emit('tab:navigated', { userId: req.body.userId, tabId, url: result.url, prevUrl: null });
@@ -3383,6 +4454,12 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
  *         schema:
  *           type: string
  *           enum: ['true', 'false']
+ *       - name: annotateScreenshot
+ *         in: query
+ *         description: When 'true', include screenshotAnnotations — per-ref bounding boxes ({ refId, role, name, x, y, width, height }) for visible elements, aligned with the screenshot pixel space.
+ *         schema:
+ *           type: string
+ *           enum: ['true', 'false']
  *     responses:
  *       200:
  *         description: Snapshot.
@@ -3395,6 +4472,9 @@ app.post('/tabs/:tabId/navigate', async (req, res) => {
  *                   type: string
  *                 snapshot:
  *                   type: string
+ *                 structure:
+ *                   type: object
+ *                   description: Optional bounded read-only DOM summary of forms and tables. The snapshot field remains unchanged.
  *                 refsCount:
  *                   type: integer
  *                 truncated:
@@ -3429,10 +4509,13 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
     // Cached chunk retrieval for offset>0 requests
     if (offset > 0 && tabState.lastSnapshot) {
       const win = windowSnapshot(tabState.lastSnapshot, offset);
-      const response = { url: tabState.page.url(), snapshot: win.text, refsCount: tabState.refs.size, truncated: win.truncated, totalChars: win.totalChars, hasMore: win.hasMore, nextOffset: win.nextOffset };
+      const response = { url: tabState.page.url(), snapshot: win.text, structure: tabState.lastStructure, refsCount: tabState.refs.size, truncated: win.truncated, totalChars: win.totalChars, hasMore: win.hasMore, nextOffset: win.nextOffset };
       if (req.query.includeScreenshot === 'true') {
         const pngBuffer = await tabState.page.screenshot({ type: 'png' });
         response.screenshot = { data: pngBuffer.toString('base64'), mimeType: 'image/png' };
+      }
+      if (req.query.annotateScreenshot === 'true') {
+        response.screenshotAnnotations = await getRefAnnotations(tabState.page, tabState.refs);
       }
       log('info', 'snapshot (cached offset)', { reqId: req.reqId, tabId: req.params.tabId, offset, totalChars: win.totalChars });
       return res.json(response);
@@ -3481,53 +4564,26 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
           const pngBuffer = await tabState.page.screenshot({ type: 'png' });
           response.screenshot = { data: pngBuffer.toString('base64'), mimeType: 'image/png' };
         }
+        if (req.query.annotateScreenshot === 'true') {
+          response.screenshotAnnotations = await getRefAnnotations(tabState.page, tabState.refs);
+        }
         return response;
       }
       
       tabState.refs = await refreshTabRefs(tabState, { reason: 'snapshot' });
       const ariaYaml = await getAriaSnapshot(tabState.page);
-      
-      let annotatedYaml = ariaYaml || '';
-      if (annotatedYaml && tabState.refs.size > 0) {
-        const refsByKey = new Map();
-        for (const [refId, info] of tabState.refs) {
-          const key = `${info.role}:${info.name}:${info.nth}`;
-          refsByKey.set(key, refId);
-        }
-        
-        const annotationCounts = new Map();
-        const lines = annotatedYaml.split('\n');
-        
-        annotatedYaml = lines.map(line => {
-          const match = line.match(/^(\s*-\s+)(\w+)(\s+"([^"]*)")?(.*)$/);
-          if (match) {
-            const [, prefix, role, nameMatch, name, suffix] = match;
-            const normalizedRole = role.toLowerCase();
-            if (normalizedRole === 'combobox') return line;
-            if (name && SKIP_PATTERNS.some(p => p.test(name))) return line;
-            if (INTERACTIVE_ROLES.includes(normalizedRole)) {
-              const normalizedName = name || '';
-              const countKey = `${normalizedRole}:${normalizedName}`;
-              const nth = annotationCounts.get(countKey) || 0;
-              annotationCounts.set(countKey, nth + 1);
-              const key = `${normalizedRole}:${normalizedName}:${nth}`;
-              const refId = refsByKey.get(key);
-              if (refId) {
-                return `${prefix}${role}${nameMatch || ''} [${refId}]${suffix}`;
-              }
-            }
-          }
-          return line;
-        }).join('\n');
-      }
+      const structure = attachStructureRefs(await extractPageStructure(tabState.page), tabState.refs);
+      let annotatedYaml = annotateAriaSnapshotRefs(ariaYaml || '', tabState.refs);
       
       tabState.lastSnapshot = annotatedYaml;
+      tabState.lastStructure = structure;
       if (annotatedYaml) snapshotBytes.labels('full').observe(Buffer.byteLength(annotatedYaml, 'utf8'));
       const win = windowSnapshot(annotatedYaml, 0);
 
       const response = {
         url: tabState.page.url(),
         snapshot: win.text,
+        structure,
         refsCount: tabState.refs.size,
         truncated: win.truncated,
         totalChars: win.totalChars,
@@ -3539,15 +4595,232 @@ app.get('/tabs/:tabId/snapshot', async (req, res) => {
         const pngBuffer = await tabState.page.screenshot({ type: 'png' });
         response.screenshot = { data: pngBuffer.toString('base64'), mimeType: 'image/png' };
       }
+      if (req.query.annotateScreenshot === 'true') {
+        response.screenshotAnnotations = await getRefAnnotations(tabState.page, tabState.refs);
+      }
 
       return response;
     })(), requestTimeoutMs(), 'snapshot'));
 
     pluginEvents.emit('tab:snapshot', { userId: req.query.userId, tabId: req.params.tabId, snapshot: result.snapshot });
-    log('info', 'snapshot', { reqId: req.reqId, tabId: req.params.tabId, url: result.url, snapshotLen: result.snapshot?.length, refsCount: result.refsCount, hasScreenshot: !!result.screenshot, truncated: result.truncated });
+    log('info', 'snapshot', { reqId: req.reqId, tabId: req.params.tabId, url: result.url, snapshotLen: result.snapshot?.length, refsCount: result.refsCount, hasScreenshot: !!result.screenshot, hasAnnotations: !!result.screenshotAnnotations, truncated: result.truncated });
     res.json(result);
   } catch (err) {
     log('error', 'snapshot failed', { reqId: req.reqId, tabId: req.params.tabId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+/**
+ * @openapi
+ * /tabs/{tabId}/ax:
+ *   get:
+ *     tags: [Content]
+ *     summary: Raw accessibility (ARIA) snapshot
+ *     description: Return the page's raw ariaSnapshot() YAML plus url, title, and viewport. Lower-level than /snapshot — it does not build or annotate refs, extract DOM structure, or manufacture candidates. Intended as an AX transport for decision models.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: userId
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *     responses:
+ *       200:
+ *         description: Raw AX snapshot.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *       400:
+ *         description: Missing userId.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.get('/tabs/:tabId/ax', async (req, res) => {
+  try {
+    const userId = req.query.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, req.params.tabId);
+    if (!found) return tabNotFoundResponse(res, req.params.tabId);
+    session.lastAccess = Date.now();
+    const { tabState } = found;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+
+    // Deliberately raw: this route is the AX transport for decision models.
+    // It does not build refs, inspect DOM nodes, extract page structure, or
+    // manufacture site-specific candidates.
+    const result = await withUserLimit(userId, () => withTimeout((async () => {
+      const url = tabState.page.url();
+      const title = await tabState.page.title().catch(() => '');
+      return { url, title, viewport: tabState.page.viewportSize() || null, snapshot: await getAriaSnapshot(tabState.page) };
+    })(), requestTimeoutMs(), 'ax'));
+    log('info', 'ax', { reqId: req.reqId, tabId: req.params.tabId, url: result.url, snapshotLen: result.snapshot?.length });
+    res.json(result);
+  } catch (err) {
+    log('error', 'ax failed', { reqId: req.reqId, tabId: req.params.tabId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+/**
+ * @openapi
+ * /tabs/{tabId}/actionables:
+ *   get:
+ *     tags: [Content]
+ *     summary: List actionable elements and text inputs
+ *     description: Discovery metadata for the current page. Returns visible link/button/combobox candidates (each paired with its ref) and visible text inputs (each with a stable targetId plus visibility and sensitivity signals). This is candidate discovery only — the selected ref is re-resolved in the interaction route before acting.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: userId
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: limit
+ *         in: query
+ *         required: false
+ *         schema:
+ *           type: integer
+ *           minimum: 1
+ *           maximum: 200
+ *         description: Maximum number of actionable candidates to return (default 100).
+ *     responses:
+ *       200:
+ *         description: Actionable candidates and text inputs.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *       400:
+ *         description: Missing userId.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.get('/tabs/:tabId/actionables', async (req, res) => {
+  try {
+    const userId = req.query.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const requestedLimit = Number.parseInt(req.query.limit, 10);
+    const limit = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 200) : 100;
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, req.params.tabId);
+    if (!found) return tabNotFoundResponse(res, req.params.tabId);
+    session.lastAccess = Date.now();
+
+    const result = await withUserLimit(userId, () => withTabLock(req.params.tabId, async () => {
+      const { tabState } = found;
+      tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+      return {
+        url: tabState.page.url(),
+        actionables: await actionablesForRefs(tabState.page, tabState.refs, { limit }),
+        inputs: await inputsForRefs(tabState.page, tabState.refs),
+      };
+    }, HANDLER_TIMEOUT_MS, () => destroyTimedOutTab(session, req.params.tabId, 'operation_timeout', userId)));
+    res.json(result);
+  } catch (err) {
+    log('error', 'actionables failed', { reqId: req.reqId, tabId: req.params.tabId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+/**
+ * @openapi
+ * /tabs/{tabId}/tables/{tableId}/rows:
+ *   get:
+ *     tags: [Content]
+ *     summary: Read paginated rows of an advertised table
+ *     description: Returns a row-paginated, read-only view of a single table. tableId must be one advertised by the current snapshot's structure (table.id or the positional table-N fallback). Rowspan/colspan are expanded so each row aligns with the header fields. Tables containing credential/secret/token/api-key inputs are not returned.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: tableId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: userId
+ *         in: query
+ *         required: true
+ *         schema:
+ *           type: string
+ *       - name: offset
+ *         in: query
+ *         required: false
+ *         schema:
+ *           type: integer
+ *           minimum: 0
+ *         description: Row offset to start from (default 0).
+ *     responses:
+ *       200:
+ *         description: A bounded page of rendered table rows.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *       400:
+ *         description: Missing userId or invalid offset.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab or advertised table not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.get('/tabs/:tabId/tables/:tableId/rows', async (req, res) => {
+  try {
+    const userId = req.query.userId;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    const offset = Number.parseInt(req.query.offset, 10);
+    if (req.query.offset !== undefined && (!Number.isInteger(offset) || offset < 0)) {
+      return res.status(400).json({ error: 'offset must be a non-negative integer' });
+    }
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, req.params.tabId);
+    if (!found) return tabNotFoundResponse(res, req.params.tabId);
+    session.lastAccess = Date.now();
+
+    const table = await withUserLimit(userId, () => withTabLock(req.params.tabId, () => extractTableRows(
+      found.tabState.page,
+      req.params.tableId,
+      offset || 0,
+    ), HANDLER_TIMEOUT_MS, () => destroyTimedOutTab(session, req.params.tabId, 'operation_timeout', userId)));
+    if (!table) return res.status(404).json({ error: 'Rendered table not found or unavailable' });
+    res.json({ url: found.tabState.page.url(), ...table });
+  } catch (err) {
+    log('error', 'table rows failed', { reqId: req.reqId, tabId: req.params.tabId, error: err.message });
     handleRouteError(err, req, res);
   }
 });
@@ -3649,11 +4922,18 @@ app.post('/tabs/:tabId/wait', async (req, res) => {
  *                 type: boolean
  *               coordinates:
  *                 type: object
+ *                 description: Viewport-coordinate click target. Use when no ref or selector addresses the element (e.g. a widget inside a cross-origin iframe).
  *                 properties:
  *                   x:
  *                     type: number
  *                   y:
  *                     type: number
+ *               expected_role:
+ *                 type: string
+ *                 description: Optional precondition. The click is refused with a 200 semantic_target_mismatch result (and a fresh snapshot) if the ref no longer resolves to this ARIA role.
+ *               expected_accessible_name:
+ *                 type: string
+ *                 description: Optional precondition. The click is refused with a 200 semantic_target_mismatch result (and a fresh snapshot) if the ref no longer resolves to this accessible name.
  *     responses:
  *       200:
  *         description: Click result with optional post-action snapshot.
@@ -3684,7 +4964,13 @@ app.post('/tabs/:tabId/click', async (req, res) => {
   const tabId = req.params.tabId;
   
   try {
-    const { userId, ref, selector } = req.body;
+    const { userId, ref, selector, coordinates, expected_role: expectedRoleInput, expected_accessible_name: expectedAccessibleNameInput } = req.body;
+    const expectedRole = typeof expectedRoleInput === 'string' && expectedRoleInput.trim()
+      ? expectedRoleInput.trim().toLowerCase()
+      : undefined;
+    const expectedAccessibleName = typeof expectedAccessibleNameInput === 'string'
+      ? expectedAccessibleNameInput
+      : undefined;
     if (!userId) return res.status(400).json({ error: 'userId required' });
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, tabId);
@@ -3694,8 +4980,9 @@ app.post('/tabs/:tabId/click', async (req, res) => {
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
     
-    if (!ref && !selector) {
-      return res.status(400).json({ error: 'ref or selector required' });
+    const hasCoordinates = coordinates && Number.isFinite(Number(coordinates.x)) && Number.isFinite(Number(coordinates.y));
+    if (!ref && !selector && !hasCoordinates) {
+      return res.status(400).json({ error: 'ref, selector, or coordinates {x, y} required' });
     }
     const selectorErr = selectorValidationError(selector);
     if (selectorErr) throw invalidSelectorError(selectorErr);
@@ -3705,6 +4992,14 @@ app.post('/tabs/:tabId/click', async (req, res) => {
       const remainingBudget = () => Math.max(0, HANDLER_TIMEOUT_MS - 2000 - (Date.now() - clickStart));
       // Full mouse event sequence for stubborn JS click handlers (mirrors Swift WebView.swift)
       // Dispatches: mouseover -> mouseenter -> mousedown -> mouseup -> click
+      const dispatchDomClick = async (locator) => {
+        await locator.evaluate((element) => {
+          if (!(element instanceof HTMLElement)) throw new Error('Element is not an HTMLElement');
+          element.click();
+        });
+        log('info', 'DOM click dispatched after Playwright click failure');
+      };
+
       const dispatchMouseSequence = async (locator) => {
         // boundingBox() with no timeout inherits Playwright's 30s default, which
         // silently eats the entire handler budget when the element detached after
@@ -3740,20 +5035,41 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         log('info', 'mouse sequence dispatched', { x: x.toFixed(0), y: y.toFixed(0) });
       };
       
+      const recoverForceClickFailure = async (locator) => {
+        try {
+          await dispatchDomClick(locator);
+        } catch (domErr) {
+          log('warn', 'DOM click fallback failed, trying mouse sequence', { error: domErr.message });
+          await dispatchMouseSequence(locator);
+        }
+      };
+
       // On Google SERPs, skip the normal click attempt (always intercepted by overlays)
       // and go directly to force click -- saves 5s timeout per click
       const onGoogleSerp = isGoogleSerp(tabState.page.url());
       
       const doClick = async (locatorOrSelector, isLocator) => {
-        const locator = isLocator ? locatorOrSelector : tabState.page.locator(locatorOrSelector);
+        let locator = isLocator ? locatorOrSelector : tabState.page.locator(locatorOrSelector);
+        // CSS selectors supplied by callers can match both the visible menu and
+        // inactive template copies. Prefer one visible match when that is
+        // unambiguous, while leaving selector lists untouched because appending
+        // :visible would change their meaning.
+        const visibleSelector = isLocator ? null : visibleSelectorCandidate(locatorOrSelector);
+        if (visibleSelector) {
+          const visibleLocator = tabState.page.locator(visibleSelector);
+          if (await visibleLocator.count() === 1) {
+            locator = visibleLocator;
+            log('info', 'click constrained selector to visible match', { selector: locatorOrSelector });
+          }
+        }
         const click = async (options) => clickWithDownloadGuard(tabState, () => locator.click(options));
         
         if (onGoogleSerp) {
           try {
             await click({ timeout: 3000, force: true });
           } catch (forceErr) {
-            log('warn', 'google force click failed, trying mouse sequence');
-            await dispatchMouseSequence(locator);
+            log('warn', 'google force click failed, trying DOM click fallback');
+            await recoverForceClickFailure(locator);
           }
           return;
         }
@@ -3768,21 +5084,42 @@ app.post('/tabs/:tabId/click', async (req, res) => {
             try {
               await click({ timeout: 3000, force: true });
             } catch (forceErr) {
-              // Fallback 2: Full mouse event sequence for stubborn JS handlers
-              log('warn', 'force click failed, trying mouse sequence');
-              await dispatchMouseSequence(locator);
+              log('warn', 'force click failed, trying DOM click fallback');
+              await recoverForceClickFailure(locator);
             }
           } else if (err.message.includes('not visible') || err.message.toLowerCase().includes('timeout')) {
-            // Fallback 2: Element not responding to click, try mouse sequence
-            log('warn', 'click timeout, trying mouse sequence');
-            await dispatchMouseSequence(locator);
+            log('warn', 'click timeout, retrying with force');
+            try {
+              await click({ timeout: Math.max(1, Math.min(3000, remainingBudget())), force: true });
+            } catch (forceErr) {
+              log('warn', 'force click failed, trying DOM click fallback');
+              await recoverForceClickFailure(locator);
+            }
           } else {
             throw err;
           }
         }
       };
       
-      if (ref) {
+      if (hasCoordinates) {
+        // Viewport-coordinate click (e.g. a caller-driven challenge widget inside a
+        // cross-origin iframe that exposes no refs). Native mouse events only.
+        const x = Number(coordinates.x);
+        const y = Number(coordinates.y);
+        await withTimeout(tabState.page.mouse.move(x, y), Math.max(1, remainingBudget()), 'native mouse move');
+        await tabState.page.waitForTimeout(50);
+        await withTimeout(tabState.page.mouse.click(x, y), Math.max(1, remainingBudget()), 'native mouse click');
+        log('info', 'coordinate click dispatched', { x: x.toFixed(0), y: y.toFixed(0) });
+        // Coordinate clicks usually target challenge widgets inside cross-origin
+        // iframes, where a post-click ref rebuild is slow and worthless. Return
+        // now; the caller re-snapshots before its next decision.
+        await tabState.page.waitForTimeout(300);
+        tabState.lastSnapshot = null;
+        tabState.refs = new Map();
+        const clickedUrl = tabState.page.url();
+        tabState.visitedUrls.add(clickedUrl);
+        return { ok: true, url: clickedUrl, refsAvailable: false };
+      } else if (ref) {
         let locator = refToLocator(tabState.page, ref, tabState.refs);
         if (!locator) {
           // Use tight timeout (4s max) to leave budget for click + post-click buildRefs
@@ -3802,6 +5139,15 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         if (!locator) {
           const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none';
           throw new StaleRefsError(ref, maxRef, tabState.refs.size);
+        }
+        // Optional semantic precondition: refuse to click if the ref no longer
+        // resolves to the role / accessible name the caller expected. Prevents
+        // acting on a stale ref that now points at a different element.
+        if (expectedRole || expectedAccessibleName !== undefined) {
+          const mismatch = await semanticTargetMismatchResult(tabState, ref, expectedRole, expectedAccessibleName);
+          if (mismatch) return mismatch;
+          locator = refToLocator(tabState.page, ref, tabState.refs);
+          if (!locator) throw new StaleRefsError(ref, 'none', tabState.refs.size);
         }
         await doClick(locator, true);
       } else {
@@ -3870,6 +5216,162 @@ app.post('/tabs/:tabId/click', async (req, res) => {
         log('warn', 'post-timeout refresh failed', { error: refreshErr.message });
       }
     }
+    handleRouteError(err, req, res);
+  }
+});
+
+// Atomic trusted pointer drag
+/**
+ * @openapi
+ * /tabs/{tabId}/drag:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Perform an atomic trusted mouse drag
+ *     description: >
+ *       Dispatches one low-level Playwright mouse gesture: move to `start`, press
+ *       `button`, move through deterministic interpolated points to `end` over
+ *       `durationMs`, and release the button. This is an atomic gesture rather
+ *       than a generic replacement for the individual mouse actions.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         description: Managed tab identifier.
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             additionalProperties: false
+ *             required: [userId, start, end]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *                 minLength: 1
+ *                 description: Non-empty user/session identifier.
+ *               start:
+ *                 type: object
+ *                 additionalProperties: false
+ *                 required: [x, y]
+ *                 properties:
+ *                   x:
+ *                     type: number
+ *                     description: Starting horizontal viewport coordinate.
+ *                   y:
+ *                     type: number
+ *                     description: Starting vertical viewport coordinate.
+ *               end:
+ *                 type: object
+ *                 additionalProperties: false
+ *                 required: [x, y]
+ *                 properties:
+ *                   x:
+ *                     type: number
+ *                     description: Ending horizontal viewport coordinate.
+ *                   y:
+ *                     type: number
+ *                     description: Ending vertical viewport coordinate.
+ *               steps:
+ *                 type: integer
+ *                 default: 12
+ *                 minimum: 1
+ *                 maximum: 24
+ *                 description: Number of interpolated moves after pressing the button.
+ *               durationMs:
+ *                 type: integer
+ *                 default: 800
+ *                 minimum: 1
+ *                 maximum: 5000
+ *                 description: Total delay, in milliseconds, distributed across the interpolated moves.
+ *               button:
+ *                 type: string
+ *                 enum: [left, right, middle]
+ *                 default: left
+ *                 description: Mouse button held for the gesture.
+ *     responses:
+ *       200:
+ *         description: Completed atomic drag gesture.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               required: [ok, start, end, steps, durationMs, button]
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 start:
+ *                   type: object
+ *                 end:
+ *                   type: object
+ *                 steps:
+ *                   type: integer
+ *                 durationMs:
+ *                   type: integer
+ *                 button:
+ *                   type: string
+ *       400:
+ *         description: Invalid request body or drag options.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       500:
+ *         description: Drag failed in the browser.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.post('/tabs/:tabId/drag', async (req, res) => {
+  const tabId = req.params.tabId;
+
+  try {
+    const validation = validateTrustedDragRequest(req.body);
+    if (!validation.ok) return res.status(400).json({ error: validation.error });
+
+    const { userId, ...dragOptions } = validation.value;
+    // Keep centralized timeout/dead-page handling on the same normalized ID
+    // used by session lookup and concurrency accounting.
+    req.body.userId = userId;
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, tabId);
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    session.lastAccess = Date.now();
+
+    const { tabState } = found;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+
+    // Camoufox may humanize each low-level mouse call. Keep the gesture budget
+    // below the lock acquisition timeout so a queued request cannot time out
+    // first and tear down the tab while this drag is still running.
+    const dragTimeoutMs = trustedDragTimeoutMs(
+      dragOptions,
+      HANDLER_TIMEOUT_MS,
+      TAB_LOCK_TIMEOUT_MS,
+    );
+    const result = await withUserLimit(userId, () => withTabLock(tabId, async () => {
+      try {
+        return await runTrustedDrag(tabState.page, dragOptions);
+      } finally {
+        // A pointer gesture can change rendered content without navigation.
+        // Never return a snapshot or refs captured before the gesture.
+        tabState.lastSnapshot = null;
+        tabState.refs = new Map();
+      }
+    }, dragTimeoutMs));
+
+    res.json(result);
+  } catch (err) {
+    log('error', 'drag failed', { reqId: req.reqId, tabId, error: err.message });
     handleRouteError(err, req, res);
   }
 });
@@ -4213,7 +5715,7 @@ app.post('/tabs/:tabId/type', async (req, res) => {
       if (shouldSubmit) await tabState.page.keyboard.press('Enter');
     });
     
-    pluginEvents.emit('tab:type', { userId: req.body.userId, tabId, text: req.body.text, ref: req.body.ref, mode: req.body.mode || 'fill' });
+    pluginEvents.emit('tab:type', typeEventPayload({ userId: req.body.userId, tabId, text: req.body.text, ref: req.body.ref, mode: req.body.mode }));
     res.json({ ok: true });
   } catch (err) {
     log('error', 'type failed', { reqId: req.reqId, error: err.message });
@@ -4238,6 +5740,93 @@ app.post('/tabs/:tabId/type', async (req, res) => {
         log('warn', 'post-timeout refresh failed', { error: refreshErr.message });
       }
     }
+    handleRouteError(err, req, res);
+  }
+});
+
+/**
+ * @openapi
+ * /tabs/{tabId}/select:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Select a native form option
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId, option]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               ref:
+ *                 type: string
+ *               selector:
+ *                 type: string
+ *               option:
+ *                 type: string
+ *                 description: Visible option label or HTML value.
+ *     responses:
+ *       200:
+ *         description: Option selected.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *       400:
+ *         description: Bad request.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+// Select a native form option by its visible label or HTML value.
+app.post('/tabs/:tabId/select', async (req, res) => {
+  const tabId = req.params.tabId;
+  try {
+    const { userId, ref, selector, option } = req.body;
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, tabId);
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    if ((!ref && !selector) || typeof option !== 'string' || !option) {
+      return res.status(400).json({ error: 'ref or selector and a nonempty option are required' });
+    }
+    const selectorErr = selectorValidationError(selector);
+    if (selectorErr) throw invalidSelectorError(selectorErr);
+    session.lastAccess = Date.now();
+    const { tabState } = found;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+    await withTabLock(tabId, async () => {
+      let locator = ref ? refToLocator(tabState.page, ref, tabState.refs) : tabState.page.locator(selector);
+      if (!locator && ref) {
+        tabState.refs = await refreshTabRefs(tabState, { reason: 'select' });
+        locator = refToLocator(tabState.page, ref, tabState.refs);
+      }
+      if (!locator) throw new StaleRefsError(ref, `e${tabState.refs.size}`, tabState.refs.size);
+      if (selector && await locator.count() === 0) {
+        const error = new Error('Selector did not match any element. Call snapshot and use a current element ref or a matching selector.');
+        error.statusCode = 422;
+        throw error;
+      }
+      await selectOption(locator, option);
+    });
+    pluginEvents.emit('tab:select', { userId, tabId, ref, option });
+    res.json({ ok: true });
+  } catch (err) {
+    log('error', 'select failed', { reqId: req.reqId, error: err.message });
     handleRouteError(err, req, res);
   }
 });
@@ -4297,12 +5886,13 @@ app.post('/tabs/:tabId/press', async (req, res) => {
     
     const { tabState } = found;
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+    const normalizedKey = normalizeBrowserKey(key);
     
     await withTabLock(tabId, async () => {
-      await tabState.page.keyboard.press(key);
+      await tabState.page.keyboard.press(normalizedKey);
     });
     
-    pluginEvents.emit('tab:press', { userId, tabId, key });
+    pluginEvents.emit('tab:press', { userId, tabId, key: normalizedKey });
     res.json({ ok: true });
   } catch (err) {
     log('error', 'press failed', { reqId: req.reqId, error: err.message });
@@ -4382,6 +5972,341 @@ app.post('/tabs/:tabId/scroll', async (req, res) => {
   }
 });
 
+/**
+ * @openapi
+ * /tabs/{tabId}/activate:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Bring a tab to the front
+ *     description: Make the tab the active/foreground page in its browser context. Useful when driving multiple tabs so input and screenshots target the intended tab.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Tab activated.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *       400:
+ *         description: Missing userId.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       410:
+ *         description: Tab was destroyed.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.post('/tabs/:tabId/activate', async (req, res) => {
+  const tabId = req.params.tabId;
+  try {
+    const { userId } = req.body || {};
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, tabId);
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    session.lastAccess = Date.now();
+
+    await withUserLimit(userId, () => withTabLock(tabId, async () => {
+      const currentSession = sessions.get(normalizeUserId(userId));
+      const current = currentSession && findTab(currentSession, tabId);
+      if (!current || current.tabState !== found.tabState || current.tabState.page?.isClosed?.()) {
+        throw new Error('Tab destroyed');
+      }
+      current.tabState.toolCalls++;
+      current.tabState.consecutiveTimeouts = 0;
+      current.tabState.consecutiveFailures = 0;
+      await current.tabState.page.bringToFront();
+    }, HANDLER_TIMEOUT_MS, () => destroyTimedOutTab(session, tabId, 'operation_timeout', userId)));
+
+    res.json({ ok: true, tabId });
+  } catch (err) {
+    log('error', 'tab activation failed', { reqId: req.reqId, tabId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+// Element-scoped mouse wheel (real Playwright wheel event at specific coordinates).
+// Use this when page-level /scroll doesn't reach a nested scrollable container
+// (e.g. virtualised feeds with anti-automation guards).
+/**
+ * @openapi
+ * /tabs/{tabId}/mouse-wheel:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Dispatch a real wheel event at element or coordinate
+ *     description: >
+ *       Moves the mouse to a target (resolved from a ref's bounding-box centre,
+ *       an explicit (x, y) pair, or the viewport centre) and dispatches a real
+ *       Playwright wheel event. Useful for nested scrollable containers that
+ *       ignore programmatic scrollTop or JS-dispatched WheelEvents.
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               ref:
+ *                 type: string
+ *                 description: Element ref (e.g. "e22"). Wheel is dispatched at its bounding-box centre.
+ *               x:
+ *                 type: number
+ *                 description: Explicit x coordinate (ignored if ref is set).
+ *               y:
+ *                 type: number
+ *                 description: Explicit y coordinate (ignored if ref is set).
+ *               deltaX:
+ *                 type: number
+ *                 default: 0
+ *                 description: Horizontal scroll delta (-100000..100000). At least one delta must be non-zero.
+ *               deltaY:
+ *                 type: number
+ *                 default: 0
+ *                 description: Vertical scroll delta (-100000..100000). At least one delta must be non-zero.
+ *     responses:
+ *       200:
+ *         description: Wheel dispatched.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 x:
+ *                   type: number
+ *                 y:
+ *                   type: number
+ *                 deltaX:
+ *                   type: number
+ *                 deltaY:
+ *                   type: number
+ *       400:
+ *         description: Missing userId, invalid coordinates/deltas, or both deltas are zero.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       422:
+ *         description: Ref is stale or the element has no bounding box.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.post('/tabs/:tabId/mouse-wheel', async (req, res) => {
+  try {
+    const { userId } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+
+    const parsed = parseWheelParams(req.body);
+    if (!parsed.ok) return res.status(400).json({ error: parsed.error, code: parsed.code });
+    const { ref, coords, deltaX, deltaY } = parsed.params;
+
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, req.params.tabId);
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    session.lastAccess = Date.now();
+
+    const { tabState } = found;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+
+    const result = await withTabLock(req.params.tabId, async () => {
+      const wheelStart = Date.now();
+      const remainingBudget = () => Math.max(0, HANDLER_TIMEOUT_MS - 2000 - (Date.now() - wheelStart));
+      let targetX, targetY;
+      if (ref) {
+        let locator = refToLocator(tabState.page, ref, tabState.refs);
+        if (!locator) {
+          try {
+            const preWheelBudget = Math.min(4000, remainingBudget());
+            tabState.refs = await refreshTabRefs(tabState, { reason: 'pre_wheel', timeoutMs: preWheelBudget });
+          } catch (e) {
+            if (e.message !== 'pre_wheel_refs_timeout' && e.message !== 'buildRefs_timeout') throw e;
+          }
+          locator = refToLocator(tabState.page, ref, tabState.refs);
+        }
+        if (!locator) {
+          const maxRef = tabState.refs.size > 0 ? `e${tabState.refs.size}` : 'none';
+          throw new StaleRefsError(ref, maxRef, tabState.refs.size);
+        }
+        // Same bounded lookup as the click path: an unbounded boundingBox()
+        // inherits Playwright's 30s default and eats the whole handler budget
+        // when the element detached, turning a 422 into a 500. The message
+        // avoids 'timed out after' so isTimeoutError() doesn't classify a
+        // detached element as a navigation timeout and destroy the session.
+        const bboxTimeout = Math.max(500, Math.min(3000, remainingBudget()));
+        let box;
+        try {
+          box = await locator.boundingBox({ timeout: bboxTimeout });
+        } catch {
+          const detachedErr = new Error(`Element not actionable: no bounding box within ${bboxTimeout}ms (element likely detached after page change). Call snapshot to refresh refs and retry.`);
+          detachedErr.statusCode = 422;
+          throw detachedErr;
+        }
+        if (!box) throw new Error('Element not visible (no bounding box)');
+        targetX = box.x + box.width / 2;
+        targetY = box.y + box.height / 2;
+      } else if (coords) {
+        targetX = coords.x;
+        targetY = coords.y;
+      } else {
+        const centre = await resolveViewportCenter(tabState.page);
+        targetX = centre.x;
+        targetY = centre.y;
+      }
+
+      await tabState.page.mouse.move(targetX, targetY);
+      await tabState.page.waitForTimeout(50);
+      await tabState.page.mouse.wheel(deltaX, deltaY);
+      await tabState.page.waitForTimeout(300);
+
+      return { x: Math.round(targetX), y: Math.round(targetY) };
+    });
+
+    pluginEvents.emit('tab:mouse-wheel', { userId, tabId: req.params.tabId, ref, deltaX, deltaY, ...result });
+    res.json({ ok: true, ...result, deltaX, deltaY });
+  } catch (err) {
+    log('error', 'mouse-wheel failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
+// Persistent init script that runs before every navigation in the tab's page context.
+// Useful for installing fetch/XHR hooks that must catch the very first request after
+// a full-page reload, where evaluate() injection arrives too late.
+/**
+ * @openapi
+ * /tabs/{tabId}/init-script:
+ *   post:
+ *     tags: [Interaction]
+ *     summary: Register a script that runs before every navigation
+ *     description: >
+ *       Adds a persistent init script to the tab's page. It executes in the page
+ *       context before any page script on every subsequent navigation, which is the
+ *       only reliable way to install fetch/XHR hooks that must catch the first
+ *       request after a full reload. Scripts accumulate: each call adds one more,
+ *       and they are dropped when the tab is destroyed. Requires the same bearer
+ *       token as /tabs/{tabId}/evaluate, since the script runs arbitrary JS.
+ *     security:
+ *       - BearerAuth: []
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId, script]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *               script:
+ *                 type: string
+ *                 description: JavaScript source evaluated in the page context before every navigation.
+ *     responses:
+ *       200:
+ *         description: Init script registered.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               properties:
+ *                 ok:
+ *                   type: boolean
+ *                 scriptLen:
+ *                   type: integer
+ *       400:
+ *         description: Missing userId or empty script.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       403:
+ *         description: Missing or invalid bearer token.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *       404:
+ *         description: Tab not found.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ */
+app.post('/tabs/:tabId/init-script', authMiddleware(), express.json({ limit: '256kb' }), async (req, res) => {
+  try {
+    const { userId, script } = req.body;
+    if (!userId) return res.status(400).json({ error: 'userId required' });
+    if (typeof script !== 'string' || !script.trim()) return res.status(400).json({ error: 'script (string) required' });
+
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, req.params.tabId);
+    if (!found) return tabNotFoundResponse(res, req.params.tabId || req.body?.tabId);
+    session.lastAccess = Date.now();
+
+    const { tabState } = found;
+    tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
+
+    await withTabLock(req.params.tabId, async () => {
+      await tabState.page.addInitScript({ content: script });
+    });
+
+    pluginEvents.emit('tab:init-script', { userId, tabId: req.params.tabId, scriptLen: script.length });
+    res.json({ ok: true, scriptLen: script.length });
+  } catch (err) {
+    log('error', 'init-script failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
 // Viewport
 /**
  * @openapi
@@ -4439,9 +6364,24 @@ app.post('/tabs/:tabId/scroll', async (req, res) => {
  *           application/json:
  *             schema:
  *               $ref: '#/components/schemas/Error'
+ *       501:
+ *         description: >
+ *           Viewport control is unsupported on this browser build because the
+ *           Juggler transport shim could not be installed. Returned with code
+ *           `viewport_unsupported`.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  */
 app.post('/tabs/:tabId/viewport', async (req, res) => {
   try {
+    if (!viewportShimInstalled) {
+      return res.status(501).json({
+        error: 'viewport control unsupported on this browser build',
+        code: 'viewport_unsupported',
+      });
+    }
     const { userId, width, height } = req.body;
     if (!Number.isFinite(width) || !Number.isFinite(height) || width < 100 || height < 100 || width > 4000 || height > 4000) {
       return res.status(400).json({ error: 'width and height required (100..4000 px)' });
@@ -4768,6 +6708,94 @@ app.get('/tabs/:tabId/links', async (req, res) => {
   }
 });
 
+// Fetch the currently displayed PDF through its existing browser context.
+/**
+ * @openapi
+ * /tabs/{tabId}/fetch-current-resource:
+ *   post:
+ *     tags: [Content]
+ *     summary: Save the current tab's PDF as a download artifact
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema:
+ *           type: string
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required: [userId]
+ *             properties:
+ *               userId:
+ *                 type: string
+ *     responses:
+ *       200:
+ *         description: Saved PDF download artifact.
+ *       404:
+ *         description: Tab not found.
+ *       415:
+ *         description: Current resource is not a PDF.
+ */
+app.post('/tabs/:tabId/fetch-current-resource', async (req, res) => {
+  try {
+    const userId = req.body?.userId;
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, req.params.tabId);
+    if (!found) return tabNotFoundResponse(res, req.params.tabId);
+    const { tabState } = found;
+    const url = tabState.page.url();
+    if (!/^https?:\/\//i.test(url)) return res.status(400).json({ error: 'Current tab does not have an HTTP resource' });
+
+    // Prefer the bytes the browser already received for the current document
+    // (inline PDF); fall back to a Node-side refetch when unavailable.
+    let body = null;
+    let mimeType = null;
+    let source = 'navigation_response';
+    const inline = await readInlinePdfResponse(tabState, url);
+    if (inline?.exceedsLimit) {
+      return res.status(413).json({ error: `Current resource exceeds ${MAX_FETCHED_RESOURCE_BYTES} byte limit` });
+    }
+    if (inline) {
+      ({ body, mimeType } = inline);
+    } else {
+      source = 'refetch';
+      const response = await tabState.page.context().request.get(url);
+      const headers = response.headers();
+      mimeType = String(headers['content-type'] || '').split(';', 1)[0].toLowerCase();
+      if (mimeType !== 'application/pdf') return res.status(415).json({ error: 'Current resource is not a PDF' });
+      const declaredBytes = Number(headers['content-length']);
+      if (Number.isFinite(declaredBytes) && declaredBytes > MAX_FETCHED_RESOURCE_BYTES) {
+        return res.status(413).json({ error: `Current resource exceeds ${MAX_FETCHED_RESOURCE_BYTES} byte limit` });
+      }
+      body = await response.body();
+    }
+    if (body.length > MAX_FETCHED_RESOURCE_BYTES) {
+      return res.status(413).json({ error: `Current resource exceeds ${MAX_FETCHED_RESOURCE_BYTES} byte limit` });
+    }
+    log('debug', 'fetch current resource', { reqId: req.reqId, source, bytes: body.length });
+    const pathname = new URL(url).pathname;
+    const filename = pathname.split('/').pop() || 'document.pdf';
+    const download = await captureFetchedResource(tabState, {
+      url,
+      mimeType,
+      filename,
+      body,
+      userId,
+      tabId: req.params.tabId,
+    });
+    tabState.toolCalls++;
+    session.lastAccess = Date.now();
+    res.json({ tabId: req.params.tabId, download });
+  } catch (err) {
+    failuresTotal.labels(classifyError(err), 'fetch_current_resource').inc();
+    log('error', 'fetch current resource failed', { reqId: req.reqId, error: err.message });
+    handleRouteError(err, req, res);
+  }
+});
+
 // Get captured downloads
 /**
  * @openapi
@@ -4827,7 +6855,11 @@ app.get('/tabs/:tabId/downloads', async (req, res) => {
     const { tabState } = found;
     tabState.toolCalls++;
 
-    const downloads = await getDownloadsList(tabState, { includeData, maxBytes });
+    const downloads = await getDownloadsList(tabState, {
+      includeData,
+      maxBytes,
+      downloadUrl: (downloadId) => `/tabs/${encodeURIComponent(req.params.tabId)}/downloads/${encodeURIComponent(downloadId)}/content?userId=${encodeURIComponent(userId)}`,
+    });
 
     if (consume) {
       await clearTabDownloads(tabState);
@@ -4838,6 +6870,60 @@ app.get('/tabs/:tabId/downloads', async (req, res) => {
     failuresTotal.labels(classifyError(err), 'downloads').inc();
     log('error', 'downloads failed', { reqId: req.reqId, error: err.message });
     res.status(500).json({ error: safeError(err) });
+  }
+});
+
+/**
+ * @openapi
+ * /tabs/{tabId}/downloads/{downloadId}/content:
+ *   get:
+ *     tags: [Content]
+ *     summary: Fetch a completed download
+ *     parameters:
+ *       - name: tabId
+ *         in: path
+ *         required: true
+ *         schema: { type: string }
+ *       - name: downloadId
+ *         in: path
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *       - name: userId
+ *         in: query
+ *         required: true
+ *         schema: { type: string }
+ *     responses:
+ *       200:
+ *         description: Raw download bytes.
+ *         content:
+ *           application/octet-stream:
+ *             schema: { type: string, format: binary }
+ *       404:
+ *         description: Download is unknown, expired, failed, or unavailable.
+ *         content:
+ *           application/json:
+ *             schema: { $ref: '#/components/schemas/Error' }
+ */
+app.get('/tabs/:tabId/downloads/:downloadId/content', async (req, res) => {
+  try {
+    const userId = req.query.userId;
+    const session = sessions.get(normalizeUserId(userId));
+    const found = session && findTab(session, req.params.tabId);
+    if (!found) return tabNotFoundResponse(res, req.params.tabId);
+    const result = await readDownloadContent(found.tabState, req.params.downloadId, userId);
+    if (!result) return res.status(404).json({ error: 'Download not found' });
+    const filename = sanitizeFilename(result.record.filename || result.record.suggestedFilename);
+    res.set({
+      'Content-Type': result.record.mimeType || 'application/octet-stream',
+      'Content-Length': String(result.data.length),
+      'Content-Disposition': `attachment; filename="${filename}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+      'Cache-Control': 'no-store',
+    });
+    return res.send(result.data);
+  } catch (err) {
+    failuresTotal.labels(classifyError(err), 'download_content').inc();
+    log('error', 'download content failed', { reqId: req.reqId, error: err.message });
+    return res.status(404).json({ error: 'Download not found' });
   }
 });
 
@@ -4932,6 +7018,13 @@ app.get('/tabs/:tabId/images', async (req, res) => {
  *         required: true
  *         schema:
  *           type: string
+ *       - name: fullPage
+ *         in: query
+ *         required: false
+ *         description: Capture the full scrollable page instead of the viewport.
+ *         schema:
+ *           type: boolean
+ *           default: false
  *     responses:
  *       200:
  *         description: Screenshot.
@@ -5073,8 +7166,25 @@ app.get('/tabs/:tabId/stats', async (req, res) => {
  *                 type: string
  *               expression:
  *                 type: string
- *                 description: JavaScript expression to evaluate.
+ *                 description: >
+ *                   JavaScript expression to evaluate. This is an expression, not a
+ *                   function body: a top-level `return` is a syntax error. Wrap
+ *                   statements in an IIFE — `(() => { ... return x; })()` — and note
+ *                   that a bare arrow function (`() => x`, uncalled) evaluates to a
+ *                   function object and serializes to no result.
+ *                 example: document.title
+ *               timeoutMs:
+ *                 type: integer
+ *                 minimum: 1000
+ *                 maximum: 900000
+ *                 description: Deadline for this evaluate. Defaults to the handler timeout. A timeout keeps the tab.
  *     responses:
+ *       504:
+ *         description: The evaluate passed timeoutMs (code evaluate_timeout). The tab is kept and the script may still be running.
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
  *       200:
  *         description: Evaluation result.
  *         content:
@@ -5086,7 +7196,10 @@ app.get('/tabs/:tabId/stats', async (req, res) => {
  *                   type: boolean
  *                 result: {}
  *       400:
- *         description: Bad request.
+ *         description: >
+ *           Bad request. `code: invalid_expression` means the expression did not
+ *           compile (for example a top-level `return`); it is not retryable until the
+ *           caller fixes the JavaScript.
  *         content:
  *           application/json:
  *             schema:
@@ -5115,6 +7228,10 @@ app.post('/tabs/:tabId/evaluate', express.json({ limit: CONFIG.evaluateMaxBodySi
     const { userId, expression } = req.body;
     if (!userId) return res.status(400).json({ error: 'userId is required' });
     if (!expression) return res.status(400).json({ error: 'expression is required' });
+    const timeoutMs = req.body.timeoutMs ?? requestTimeoutMs();
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1000 || timeoutMs > EVALUATE_MAX_TIMEOUT_MS) {
+      return res.status(400).json({ error: `timeoutMs must be an integer from 1000 to ${EVALUATE_MAX_TIMEOUT_MS}` });
+    }
 
     const session = sessions.get(normalizeUserId(userId));
     const found = session && findTab(session, req.params.tabId);
@@ -5125,20 +7242,36 @@ app.post('/tabs/:tabId/evaluate', express.json({ limit: CONFIG.evaluateMaxBodySi
     tabState.toolCalls++; tabState.consecutiveTimeouts = 0; tabState.consecutiveFailures = 0;
 
     pluginEvents.emit('tab:evaluate', { userId, tabId: req.params.tabId, expression });
-    const result = await withUserLimit(userId, () => withTabLock(
-      req.params.tabId,
-      () => tabState.page.evaluate(expression),
-      requestTimeoutMs(),
-      () => destroyTimedOutTab(session, req.params.tabId, 'operation_timeout', userId),
-    ));
+    // The idle reapers count tool calls, not running scripts, so a running evaluate holds its tab
+    // busy until it settles or reaches its deadline (a script may never settle).
+    const evaluate = () => {
+      const running = { until: Date.now() + timeoutMs };
+      (tabState.evaluating ??= new Set()).add(running);
+      return tabState.page.evaluate(expression).finally(() => tabState.evaluating.delete(running));
+    };
+    // A slow script is the caller's, not a stuck tab: on timeout the tab and its page stay up.
+    // Evaluate never takes the per-tab lock: a stuck script must not block other evaluates on the
+    // same tab. Playwright tolerates concurrent page.evaluate; the lock hardening still serializes
+    // the mutating operations (click/type/navigate) where overlapping CDP calls corrupt state.
+    const result = await withUserLimit(userId, () => withTimeout(evaluate(), timeoutMs, 'action'));
     pluginEvents.emit('tab:evaluated', { userId, tabId: req.params.tabId, result });
     log('info', 'evaluate', { reqId: req.reqId, tabId: req.params.tabId, userId, resultType: typeof result });
     res.json({ ok: true, result });
   } catch (err) {
     log('error', 'evaluate failed', { reqId: req.reqId, tabId: req.params.tabId, error: err.message });
+    if (isTimeoutError(err)) {
+      return res.status(504).json({
+        error: `${err.message}; the tab was kept and the script may still be running in the page`,
+        code: 'evaluate_timeout', retryable: false, tabKept: true,
+      });
+    }
     handleRouteError(err, req, res);
   }
 });
+
+function isEvaluating(tabState, now) {
+  return Array.from(tabState.evaluating ?? []).some((running) => running.until > now);
+}
 
 // Structured extraction using JSON Schema with x-ref hints
 /**
@@ -5338,9 +7471,7 @@ app.delete('/tabs/:tabId', async (req, res) => {
       await safePageClose(found.tabState.page);
       found.group.delete(req.params.tabId);
       { const _l = tabLocks.get(req.params.tabId); if (_l) _l.drain(); tabLocks.delete(req.params.tabId); refreshTabLockQueueDepth(); }
-      if (found.group.size === 0) {
-        session.tabGroups.delete(found.listItemId);
-      }
+      dropEmptyTabGroup(session, found.listItemId, found.group);
       refreshActiveTabsGauge();
       log('info', 'tab closed', { reqId: req.reqId, tabId: req.params.tabId, userId });
     }
@@ -5403,8 +7534,10 @@ app.delete('/tabs/group/:listItemId', async (req, res) => {
           lock.drain();
           tabLocks.delete(tabId);
         }
+        group.delete(tabId);
       }
-      session.tabGroups.delete(req.params.listItemId);
+      // Do not remove a replacement group registered under the same key.
+      dropEmptyTabGroup(session, req.params.listItemId, group);
       refreshTabLockQueueDepth();
       refreshActiveTabsGauge();
       log('info', 'tab group closed', { reqId: req.reqId, listItemId: req.params.listItemId, userId });
@@ -5684,7 +7817,10 @@ app.delete('/sessions/:userId', async (req, res) => {
 setInterval(() => {
   const now = Date.now();
   for (const [userId, session] of Array.from(sessions.entries())) {
-    if (now - session.lastAccess > SESSION_TIMEOUT_MS) {
+    const evaluating = Array.from(session.tabGroups.values()).some((group) =>
+      Array.from(group.values()).some((tabState) => isEvaluating(tabState, now)));
+    if (evaluating) session.lastAccess = now;
+    if (SESSION_TIMEOUT_MS > 0 && now - session.lastAccess > SESSION_TIMEOUT_MS) {
       session._closing = true;
       const idleMs = now - session.lastAccess;
       sessionsExpiredTotal.inc();
@@ -5752,16 +7888,22 @@ setInterval(() => {
   for (const [userId, session] of sessions) {
     for (const [listItemId, group] of session.tabGroups) {
       for (const [tabId, tabState] of group) {
-        if (!tabState._lastReaperCheck) {
+        if (!tabState._lastReaperCheck || isEvaluating(tabState, now)) {
           tabState._lastReaperCheck = now;
           tabState._lastReaperToolCalls = tabState.toolCalls;
           continue;
         }
         if (tabState.toolCalls === tabState._lastReaperToolCalls) {
           const idleMs = now - tabState._lastReaperCheck;
-          if (idleMs >= TAB_INACTIVITY_MS) {
+          // A crashed page keeps holding a content-process slot for as long as
+          // it stays registered; waiting out the full idle timeout only delays
+          // the leak. Reap crashed tabs after a short quiet period instead —
+          // long enough that an in-flight call which just surfaced the crash
+          // (and will retry on a new tab) has time to finish.
+          const reapAfterMs = tabState.crashed ? Math.min(60_000, TAB_INACTIVITY_MS) : TAB_INACTIVITY_MS;
+          if (idleMs >= reapAfterMs) {
             tabsReapedTotal.inc();
-            log('info', 'tab reaped (inactive)', { userId, tabId, listItemId, idleMs, toolCalls: tabState.toolCalls });
+            log('info', 'tab reaped (inactive)', { userId, tabId, listItemId, idleMs, toolCalls: tabState.toolCalls, crashed: !!tabState.crashed });
             safePageClose(tabState.page);
             group.delete(tabId);
             { const _l = tabLocks.get(tabId); if (_l) _l.drain(); tabLocks.delete(tabId); }
@@ -5816,44 +7958,95 @@ setInterval(() => {
   if (reaped > 0) log('warn', 'orphan page reaper closed leaked pages', { reaped });
 }, 60_000);
 
-// Idle memory pressure restart -- when all sessions are gone, kill the browser
-// process immediately if either Node native memory or the Camoufox process tree
-// is large. This prevents idle Firefox children from holding most of the VM RAM
-// while Node reports zero sessions/tabs.
-setInterval(() => {
-  if (sessions.size > 0 || !browser) return;
-  const mem = process.memoryUsage();
-  const nativeMemMb = Math.round((mem.rss - mem.heapUsed) / 1048576);
-  const browserRssMb = browserProcessTreeRssMb(_browserPid()) ?? browserProcessNameRssMb();
+// Memory pressure restart -- when either Node native (non-heap) memory or the
+// Camoufox process tree grows past its threshold, restart the browser to
+// release the leaked memory.
+//
+// Idle phase (no sessions): kill the browser directly; the next request
+// relaunches it. This prevents idle Firefox children from holding most of the
+// VM RAM while Node reports zero sessions/tabs.
+//
+// Active phase (sessions open): close the sessions first so in-flight and
+// follow-up requests see a clean 503 (session_expired) instead of a half-dead
+// context, and clients recreate their session on retry. Without this branch,
+// a leaking browser with a live session would never be restarted until the
+// session went idle, and could OOM the host in the meantime.
+//
+// Note: if the threshold is hit while sessions are routinely reopened at the
+// same scale, this will restart in a loop — the log lines below make that
+// visible; in that case raise BROWSER_RSS_RESTART_THRESHOLD_MB.
+//
+// Two guards keep this from thrashing:
+//  - _memPressureInFlight: only one memory restart runs at a time, since the
+//    active-phase session close can itself stall on the hung storageState call
+//    we are trying to recover from, and the 30s timer would otherwise re-enter
+//    and run a second concurrent teardown of the same sessions.
+//  - MEM_PRESSURE_RESTART_COOLDOWN_MS: skip the whole check for a while after a
+//    restart. A just-killed Camoufox tree lingers for tens of seconds, and the
+//    name-based RSS fallback sums old + new firefox processes by name, so a
+//    fresh browser can look instantly over-threshold and get re-killed.
+const MEM_PRESSURE_RESTART_COOLDOWN_MS = 120_000;
+let _memPressureInFlight = false;
+setInterval(async () => {
+  if (_memPressureInFlight) return;
+  try {
+    if (!browser) return;
+    if (_lastBrowserRestartAt && (Date.now() - _lastBrowserRestartAt) < MEM_PRESSURE_RESTART_COOLDOWN_MS) return;
+    const idle = sessions.size === 0;
+    const mem = process.memoryUsage();
+    const nativeMemMb = Math.round((mem.rss - mem.heapUsed) / 1048576);
+    // During the post-restart window the name fallback is unreliable (it would
+    // count a dying old tree); the cooldown above already excludes that window,
+    // so by here the PID-tree reading is the trustworthy source.
+    const browserRssMb = browserProcessTreeRssMb(_browserPid()) ?? browserProcessNameRssMb();
 
-  if (browserRssMb !== null && browserRssMb >= CONFIG.browserRssRestartThresholdMb) {
-    log('warn', 'browser rss pressure, restarting browser', {
-      browserRssMb,
-      thresholdMb: CONFIG.browserRssRestartThresholdMb,
-    });
-    browserRestartsTotal.labels('browser_rss_pressure').inc();
-    closeBrowserFully('browser_rss_pressure').catch((err) => {
-      log('error', 'browser rss pressure browser close failed', { error: err.message });
-    });
-    return;
-  }
+    let reason = null;
+    if (browserRssMb !== null && browserRssMb >= CONFIG.browserRssRestartThresholdMb) {
+      reason = 'browser_rss_pressure';
+      log('warn', 'browser rss pressure, restarting browser', {
+        browserRssMb,
+        thresholdMb: CONFIG.browserRssRestartThresholdMb,
+        idle,
+        sessions: sessions.size,
+      });
+    } else if (idle) {
+      // Native-memory baseline is only meaningful within one browser launch
+      // cycle (it is reset in closeBrowserFully), so track it when idle.
+      if (_nativeMemBaseline === null) {
+        _nativeMemBaseline = nativeMemMb;
+        return;
+      }
+      const growth = nativeMemMb - _nativeMemBaseline;
+      if (growth >= NATIVE_MEM_RESTART_THRESHOLD_MB) {
+        reason = 'memory_pressure';
+        log('warn', 'native memory pressure, restarting browser', {
+          baselineMb: _nativeMemBaseline,
+          currentMb: nativeMemMb,
+          growthMb: growth,
+          thresholdMb: NATIVE_MEM_RESTART_THRESHOLD_MB,
+        });
+      }
+    }
+    if (!reason) return;
 
-  if (_nativeMemBaseline === null) {
-    _nativeMemBaseline = nativeMemMb;
-    return;
-  }
-  const growth = nativeMemMb - _nativeMemBaseline;
-  if (growth >= NATIVE_MEM_RESTART_THRESHOLD_MB) {
-    log('warn', 'native memory pressure, restarting browser', {
-      baselineMb: _nativeMemBaseline,
-      currentMb: nativeMemMb,
-      growthMb: growth,
-      thresholdMb: NATIVE_MEM_RESTART_THRESHOLD_MB,
-    });
-    browserRestartsTotal.labels('memory_pressure').inc();
-    closeBrowserFully('memory_pressure').catch((err) => {
-      log('error', 'memory pressure browser close failed', { error: err.message });
-    });
+    _memPressureInFlight = true;
+    browserRestartsTotal.labels(reason).inc();
+    if (!idle) {
+      try {
+        await closeAllSessions(`memory_pressure:${reason}`, { clearDownloads: true, clearLocks: true });
+      } catch (err) {
+        log('warn', 'memory pressure session close failed', { error: err.message });
+      }
+    }
+    try {
+      await closeBrowserFully(reason);
+    } catch (err) {
+      log('error', 'memory pressure browser close failed', { reason, error: err.message });
+    }
+  } catch (err) {
+    log('warn', 'memory pressure check failed', { error: err.message });
+  } finally {
+    _memPressureInFlight = false;
   }
 }, 30_000);
 
@@ -6027,7 +8220,7 @@ app.post('/tabs/open', async (req, res) => {
     let totalTabs = 0;
     for (const g of session.tabGroups.values()) totalTabs += g.size;
     if (totalTabs >= MAX_TABS_PER_SESSION || getTotalTabCount() >= MAX_TABS_GLOBAL) {
-      const recycled = await recycleOldestTab(session, req.reqId, userId);
+      const recycled = await recycleOldestTab(session, req.reqId, userId, listItemId);
       if (!recycled) {
         return res.status(429).json({ error: 'Maximum tabs per session reached' });
       }
@@ -6338,7 +8531,7 @@ app.get('/snapshot', async (req, res) => {
     // Cached chunk retrieval
     if (offset > 0 && tabState.lastSnapshot) {
       const win = windowSnapshot(tabState.lastSnapshot, offset);
-      const response = { ok: true, format: 'aria', targetId, url: tabState.page.url(), snapshot: win.text, refsCount: tabState.refs.size, truncated: win.truncated, totalChars: win.totalChars, hasMore: win.hasMore, nextOffset: win.nextOffset };
+      const response = { ok: true, format: 'aria', targetId, url: tabState.page.url(), snapshot: win.text, structure: tabState.lastStructure, refsCount: tabState.refs.size, truncated: win.truncated, totalChars: win.totalChars, hasMore: win.hasMore, nextOffset: win.nextOffset };
       if (req.query.includeScreenshot === 'true') {
         const pngBuffer = await tabState.page.screenshot({ type: 'png' });
         response.screenshot = { data: pngBuffer.toString('base64'), mimeType: 'image/png' };
@@ -6353,6 +8546,7 @@ app.get('/snapshot', async (req, res) => {
       const { refs: googleRefs, snapshot: googleSnapshot } = await extractGoogleSerp(tabState.page);
       tabState.refs = googleRefs;
       tabState.lastSnapshot = googleSnapshot;
+      tabState.lastStructure = null;
       snapshotBytes.labels('google_serp').observe(Buffer.byteLength(googleSnapshot, 'utf8'));
       const annotatedYaml = googleSnapshot;
       const win = windowSnapshot(annotatedYaml, 0);
@@ -6372,8 +8566,7 @@ app.get('/snapshot', async (req, res) => {
     tabState.refs = await buildRefs(tabState.page);
     
     const ariaYaml = await getAriaSnapshot(tabState.page);
-    
-    // Annotate YAML with ref IDs
+    const structure = attachStructureRefs(await extractPageStructure(tabState.page), tabState.refs);
     let annotatedYaml = ariaYaml || '';
     if (annotatedYaml && tabState.refs.size > 0) {
       const refsByKey = new Map();
@@ -6398,6 +8591,7 @@ app.get('/snapshot', async (req, res) => {
     }
     
     tabState.lastSnapshot = annotatedYaml;
+    tabState.lastStructure = structure;
     if (annotatedYaml) snapshotBytes.labels('full').observe(Buffer.byteLength(annotatedYaml, 'utf8'));
     const win = windowSnapshot(annotatedYaml, 0);
 
@@ -6407,6 +8601,7 @@ app.get('/snapshot', async (req, res) => {
       targetId,
       url: tabState.page.url(),
       snapshot: win.text,
+      structure,
       refsCount: tabState.refs.size,
       truncated: win.truncated,
       totalChars: win.totalChars,
@@ -6698,18 +8893,13 @@ setInterval(async () => {
     log('warn', 'health probe forced despite active ops', { activeOps: healthState.activeOps, timeSinceSuccessMs: timeSinceSuccess });
   }
   
-  let testContext;
   try {
-    testContext = await browser.newContext({ viewport: null });
-    const page = await testContext.newPage();
-    await page.goto('about:blank', { timeout: 5000 });
-    await page.close();
-    await testContext.close();
+    await healthProbe.probe();
     healthState.lastSuccessfulNav = Date.now();
   } catch (err) {
     failuresTotal.labels('health_probe', 'internal').inc();
     log('warn', 'health probe failed', { error: err.message, timeSinceSuccessMs: timeSinceSuccess });
-    if (testContext) await testContext.close().catch(() => {});
+    await healthProbe.dispose();
     restartBrowser('health probe failed').catch(() => {});
   }
 }, 60_000);
@@ -6744,7 +8934,7 @@ async function gracefulShutdown(signal) {
   const forceTimeout = setTimeout(() => {
     log('error', 'shutdown timed out, forcing exit');
     process.exit(1);
-  }, 10000);
+  }, CONFIG.shutdownTimeoutMs);
   forceTimeout.unref();
 
   server.close();
@@ -6798,8 +8988,7 @@ const pluginCtx = {
   failuresTotal,
   metricsRegistry: getRegister,
   createMetric,
-  /** Factory for Xvfb virtual display. Plugins can replace this to customise resolution/args. */
-  createVirtualDisplay: () => new DefaultVirtualDisplay(),
+  registerVirtualDisplayProvider: (pluginName, factory) => virtualDisplayRegistry.register(pluginName, factory),
   /** The upstream VirtualDisplay class -- plugins can subclass it. */
   VirtualDisplay,
 };
@@ -6827,20 +9016,6 @@ const server = app.listen(PORT, CONFIG.bindHost || undefined, async () => {
   if (tmpCleanup.removed > 0) {
     log('info', 'cleaned up orphaned camoufox temp files', tmpCleanup);
   }
-  const profileCleanup = cleanupStaleFirefoxProfiles();
-  if (profileCleanup.removed > 0) {
-    log('info', 'cleaned up stale firefox profiles on startup', profileCleanup);
-  }
-
-  // Periodic temp profile cleanup every 10 minutes
-  setInterval(() => {
-    try {
-      const cleaned = cleanupStaleFirefoxProfiles();
-      if (cleaned.removed > 0) {
-        log('info', 'periodic firefox profile cleanup', cleaned);
-      }
-    } catch { /* best effort */ }
-  }, 10 * 60 * 1000).unref();
   const traceSweep = sweepOldTraces({
     baseDir: CONFIG.tracesDir,
     ttlMs: CONFIG.tracesTtlHours * 3600 * 1000,

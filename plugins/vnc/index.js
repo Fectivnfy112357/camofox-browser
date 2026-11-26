@@ -37,6 +37,7 @@
  * Registers:
  *   GET /vnc/status -- report watcher state and configured ports
  *   GET /sessions/:userId/storage_state -- export Playwright storageState as JSON
+ *   POST /sessions/:userId/front -- raise the user's newest window on the shared display
  *
  * Events emitted:
  *   vnc:watcher:started    { pid }
@@ -50,9 +51,10 @@ import { removeXvfbDisplayFiles } from '../../lib/tmp-cleanup.js';
 
 export async function register(app, ctx, pluginConfig = {}) {
   const { events, config, log, sessions, VirtualDisplay, safeError } = ctx;
+  const settings = ctx.plugin?.settings || pluginConfig;
 
-  // Resolve all config (env vars + pluginConfig) via the launcher module
-  const vncConfig = resolveVncConfig(pluginConfig);
+  // Resolve all config (env vars + plugin settings) via the launcher module
+  const vncConfig = resolveVncConfig(settings);
 
   if (!vncConfig.enabled) {
     log('info', 'vnc plugin: disabled (set ENABLE_VNC=1 or plugins.vnc.enabled=true)');
@@ -86,8 +88,8 @@ export async function register(app, ctx, pluginConfig = {}) {
     }
   }
 
-  ctx.createVirtualDisplay = () => new VncVirtualDisplay();
-  log('info', 'vnc plugin: overriding Xvfb resolution', { resolution });
+  ctx.plugin.registerVirtualDisplayProvider(() => new VncVirtualDisplay());
+  log('info', 'vnc plugin: registered Xvfb display provider', { resolution });
 
   // --- VNC watcher process ---
   log('info', 'vnc plugin enabled', {
@@ -165,6 +167,22 @@ export async function register(app, ctx, pluginConfig = {}) {
       res.json(state);
     } catch (err) {
       log('error', 'storage_state export failed', { reqId: req.reqId, error: err.message });
+      res.status(500).json({ error: safeError(err) });
+    }
+  });
+
+  // --- HTTP endpoint: POST /sessions/:userId/front ---
+  app.post('/sessions/:userId/front', authMiddleware, async (req, res) => {
+    const userId = String(req.params.userId);
+    try {
+      const page = sessions.get(userId)?.context.pages().at(-1);
+      if (!page) {
+        return res.status(404).json({ error: `No browser window for userId="${userId}"` });
+      }
+      await page.bringToFront();
+      res.json({ ok: true });
+    } catch (err) {
+      log('error', 'bring to front failed', { reqId: req.reqId, userId, error: err.message });
       res.status(500).json({ error: safeError(err) });
     }
   });

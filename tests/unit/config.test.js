@@ -42,6 +42,50 @@ describe('loadConfig', () => {
     expect(loadConfig().camoufoxExecutablePath).toBe('/legacy/camoufox');
   });
 
+  test('validates the configured proxy protocol', () => {
+    process.env.PROXY_PROTOCOL = 'socks5';
+    expect(loadConfig().proxy.protocol).toBe('socks5');
+
+    process.env.PROXY_PROTOCOL = 'ftp';
+    expect(() => loadConfig()).toThrow('PROXY_PROTOCOL must be http, https, socks4, or socks5');
+  });
+
+  test('configures an optional direct browser identity and forwards it to subprocesses', () => {
+    process.env.CAMOFOX_LOCALE = 'en-AU';
+    process.env.CAMOFOX_TIMEZONE = 'Australia/Sydney';
+
+    const config = loadConfig();
+
+    expect(config.directIdentity).toEqual({ locale: 'en-AU', timezoneId: 'Australia/Sydney' });
+    expect(config.serverEnv.CAMOFOX_LOCALE).toBe('en-AU');
+    expect(config.serverEnv.CAMOFOX_TIMEZONE).toBe('Australia/Sydney');
+  });
+
+  test('does not set a direct browser identity unless both values are configured', () => {
+    delete process.env.CAMOFOX_LOCALE;
+    delete process.env.CAMOFOX_TIMEZONE;
+    expect(loadConfig().directIdentity).toBeNull();
+
+    process.env.CAMOFOX_LOCALE = 'en-AU';
+    expect(() => loadConfig()).toThrow('CAMOFOX_LOCALE and CAMOFOX_TIMEZONE must be set together');
+
+    process.env.CAMOFOX_TIMEZONE = 'Not/A_Timezone';
+    expect(() => loadConfig()).toThrow('CAMOFOX_TIMEZONE must be a valid IANA timezone');
+  });
+
+  test('configures an optional fingerprint OS and forwards it to subprocesses', () => {
+    delete process.env.CAMOFOX_OS;
+    expect(loadConfig().fingerprintOs).toBeNull();
+
+    process.env.CAMOFOX_OS = 'Windows';
+    const config = loadConfig();
+    expect(config.fingerprintOs).toBe('windows');
+    expect(config.serverEnv.CAMOFOX_OS).toBe('Windows');
+
+    process.env.CAMOFOX_OS = 'android';
+    expect(() => loadConfig()).toThrow('CAMOFOX_OS must be windows, macos, or linux');
+  });
+
   test('configures and forwards the upload directory', () => {
     process.env.CAMOFOX_UPLOADS_DIR = '/mounted/uploads';
 
@@ -61,12 +105,62 @@ describe('loadConfig', () => {
     expect(config.serverEnv.CAMOFOX_EVALUATE_MAX_BODY_SIZE).toBe('10mb');
   });
 
+  test('preserves zero timeout values to disable session expiry and idle shutdown', () => {
+    process.env.SESSION_TIMEOUT_MS = '0';
+    process.env.BROWSER_IDLE_TIMEOUT_MS = '0';
+
+    const config = loadConfig();
+
+    expect(config.sessionTimeoutMs).toBe(0);
+    expect(config.browserIdleTimeoutMs).toBe(0);
+  });
+
+  test('uses default timeout values when timeout environment variables are unset or invalid', () => {
+    delete process.env.SESSION_TIMEOUT_MS;
+    delete process.env.BROWSER_IDLE_TIMEOUT_MS;
+    expect(loadConfig().sessionTimeoutMs).toBe(600000);
+    expect(loadConfig().browserIdleTimeoutMs).toBe(300000);
+
+    process.env.SESSION_TIMEOUT_MS = 'not-a-number';
+    process.env.BROWSER_IDLE_TIMEOUT_MS = 'not-a-number';
+    expect(loadConfig().sessionTimeoutMs).toBe(600000);
+    expect(loadConfig().browserIdleTimeoutMs).toBe(300000);
+  });
+
   test('configures browser RSS restart threshold', () => {
     delete process.env.BROWSER_RSS_RESTART_THRESHOLD_MB;
     expect(loadConfig().browserRssRestartThresholdMb).toBe(1500);
 
     process.env.BROWSER_RSS_RESTART_THRESHOLD_MB = '2048';
     expect(loadConfig().browserRssRestartThresholdMb).toBe(2048);
+  });
+
+  test('configures and forwards navigation timeout', () => {
+    delete process.env.NAVIGATE_TIMEOUT_MS;
+    expect(loadConfig().navigateTimeoutMs).toBe(30000);
+
+    process.env.NAVIGATE_TIMEOUT_MS = '60000';
+    const config = loadConfig();
+    expect(config.navigateTimeoutMs).toBe(60000);
+    expect(config.serverEnv.NAVIGATE_TIMEOUT_MS).toBe('60000');
+  });
+
+  test('uses a positive shutdown watchdog timeout and forwards it to server subprocesses', () => {
+    delete process.env.CAMOFOX_SHUTDOWN_TIMEOUT_MS;
+    expect(loadConfig().shutdownTimeoutMs).toBe(45000);
+
+    process.env.CAMOFOX_SHUTDOWN_TIMEOUT_MS = '60000';
+    const configured = loadConfig();
+    expect(configured.shutdownTimeoutMs).toBe(60000);
+    expect(configured.serverEnv.CAMOFOX_SHUTDOWN_TIMEOUT_MS).toBe('60000');
+
+    for (const value of ['0', '-1', 'not-a-number', 'Infinity', '2147483648', '9007199254740992']) {
+      process.env.CAMOFOX_SHUTDOWN_TIMEOUT_MS = value;
+      expect(loadConfig().shutdownTimeoutMs).toBe(45000);
+    }
+
+    process.env.CAMOFOX_SHUTDOWN_TIMEOUT_MS = '2147483647';
+    expect(loadConfig().shutdownTimeoutMs).toBe(2147483647);
   });
 
   test('reads newPageTimeoutMs from camofox.config.json with a 10s fallback', () => {

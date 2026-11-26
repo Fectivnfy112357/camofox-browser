@@ -35,7 +35,17 @@ function createTestApp() {
       </body></html>
     `);
   });
-  
+
+  // A deterministic upstream failure for navigation error handling tests.
+  app.get('/unavailable', (req, res) => {
+    res.status(503).send('Temporarily unavailable');
+  });
+
+  // A response that never completes, used to exercise navigation timeouts.
+  app.get('/slow-navigation', () => {
+    // Deliberately leave the HTTP response open until the browser aborts it.
+  });
+
   // Page that fires a client-side redirect shortly after DOMContentLoaded
   app.get('/lateRedirect', (req, res) => {
     res.send(`
@@ -152,6 +162,23 @@ function createTestApp() {
       </body></html>
     `);
   });
+
+  app.get('/structure', (req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Structure Test</title></head>
+      <body>
+        <form id="report-filters" method="get">
+          <label for="period">Period</label>
+          <select id="period" name="period"><option value="month">Month</option><option value="year" selected>Year</option></select>
+          <label for="from">From</label><input id="from" name="from" value="2022-01-01" />
+          <input id="api_token" name="api_token" value="must-not-appear" />
+          <button id="show-report" type="submit">Show Report</button>
+        </form>
+        <table id="sales"><thead><tr><th>Product</th><th>Quantity</th></tr></thead><tbody><tr><td>Yoga ball</td><td>7</td></tr></tbody></table>
+      </body></html>
+    `);
+  });
   
   // Page with refresh counter (to verify refresh actually works)
   let refreshCount = 0;
@@ -173,6 +200,50 @@ function createTestApp() {
     res.json({ ok: true });
   });
   
+  // Page with a low-level drag target. The endpoint test asserts browser mouse
+  // events arrive at the page and that the final mouseup lands in the target.
+  app.get('/drag', (req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Drag Test</title>
+      <style>
+        body { margin: 0; font-family: sans-serif; }
+        #source, #target { position: absolute; top: 100px; width: 100px; height: 80px; }
+        #source { left: 40px; background: #4a90e2; color: white; }
+        #target { left: 400px; background: #ddd; border: 2px dashed #555; }
+      </style>
+      </head>
+      <body>
+        <div id="source">Drag source</div>
+        <div id="target">Drop target</div>
+        <p id="status">idle</p>
+        <script>
+          const source = document.getElementById('source');
+          const target = document.getElementById('target');
+          const status = document.getElementById('status');
+          let pressed = false;
+          let moves = 0;
+          source.addEventListener('mousedown', () => {
+            pressed = true;
+            moves = 0;
+            status.textContent = 'pressed';
+          });
+          document.addEventListener('mousemove', () => {
+            if (pressed) moves += 1;
+          });
+          document.addEventListener('mouseup', (event) => {
+            if (!pressed) return;
+            pressed = false;
+            const box = target.getBoundingClientRect();
+            const landed = event.clientX >= box.left && event.clientX <= box.right &&
+              event.clientY >= box.top && event.clientY <= box.bottom;
+            status.textContent = (landed ? 'dropped:' : 'missed:') + moves;
+          });
+        </script>
+      </body></html>
+    `);
+  });
+
   // Page with clickable button
   app.get('/click', (req, res) => {
     res.send(`
@@ -187,6 +258,42 @@ function createTestApp() {
             document.getElementById('result').textContent = 'Button was clicked!';
           });
         </script>
+      </body></html>
+    `);
+  });
+
+  app.get('/click-refs', (req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Click Ref Test</title></head>
+      <body>
+        <nav><button type="button" id="navigation" onclick="result.textContent = 'Wrong navigation button'">Documents</button></nav>
+        <button type="button" id="unnamed" onclick="result.textContent = 'Clicked unnamed button'"><img alt=""></button>
+        <button type="button" id="save-all" onclick="result.textContent = 'Clicked Save all'">Save all</button>
+        <button type="button" id="save" onclick="result.textContent = 'Clicked Save'">Save</button>
+        <p id="result">Pending</p>
+      </body></html>
+    `);
+  });
+
+  app.get('/click-refs-frame', (req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Click Frame Ref Test</title></head>
+      <body>
+        <iframe title="Ref Test" name="ref-test" src="/click-refs-frame-content"></iframe>
+      </body></html>
+    `);
+  });
+
+  app.get('/click-refs-frame-content', (req, res) => {
+    res.send(`
+      <!DOCTYPE html>
+      <html><head><title>Click Frame Content</title></head>
+      <body>
+        <button type="button" onclick="result.textContent = 'Wrong frame button'">Documents</button>
+        <button type="button" onclick="result.textContent = 'Clicked unnamed frame button'"><img alt=""></button>
+        <p id="result">Pending</p>
       </body></html>
     `);
   });
@@ -253,6 +360,12 @@ function createTestApp() {
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('Content-Disposition', 'attachment; filename="hello.txt"');
     res.send(body);
+  });
+
+  app.get('/inline-document.pdf', (req, res) => {
+    // Small valid PDF fixture. No Content-Disposition means Firefox displays it inline.
+    const pdf = '%PDF-1.1\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Count 0>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF\n';
+    res.type('application/pdf').send(pdf);
   });
 
   // Page with a direct file input for upload endpoint tests
@@ -336,12 +449,14 @@ function createTestApp() {
   });
 
   app.get('/popup-target', (req, res) => {
+    const closesItself = req.query.close === '1';
     res.send(`
       <!DOCTYPE html>
       <html><head><title>Popup Target</title></head>
       <body>
         <h1>Popup Target Page</h1>
         <p>This page was opened as a popup.</p>
+        ${closesItself ? '<script>setTimeout(() => window.close(), 50)</script>' : ''}
       </body></html>
     `);
   });
